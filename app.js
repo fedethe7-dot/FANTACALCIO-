@@ -1,7 +1,7 @@
 'use strict';
 /* Fanta 26/27 – app personale per la rosa Mantra. Dati nel foglio Google via Apps Script. */
 
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -687,8 +687,8 @@ function vAltro() {
   <div class="grid grid-2">
     <div class="card" id="import"><h3>Carica voti giornata</h3>
       <label class="drop">${ICON.up.replace('<svg', '<svg style="width:28px;height:28px;margin:0 auto 8px;stroke:var(--accent)"')}
-        <b>Scegli il file dei voti</b><div class="small muted">Excel scaricato da fantacalcio.it (Voti_Fantacalcio_…_Giornata_N.xlsx)</div>
-        <input type="file" id="fileVoti" accept=".xlsx,.xls"></label>
+        <b>Scegli i file dei voti</b><div class="small muted">Excel scaricati da fantacalcio.it (Voti_Fantacalcio_…_Giornata_N.xlsx). Puoi sceglierne anche più di uno insieme.</div>
+        <input type="file" id="fileVoti" accept=".xlsx,.xls" multiple></label>
       <div class="field" style="margin-top:12px"><label for="votoFoglio">Voto da usare</label>
         <select class="input" id="votoFoglio">${['Fantacalcio', 'Statistico', 'Italia'].map(x => `<option ${x === (c.votoFoglio || 'Fantacalcio') ? 'selected' : ''}>${x}</option>`).join('')}</select></div>
       ${d ? `<div class="tag-line">${d.gA.map(g => `<span class="chip ok">${g}ª ✓ <button class="x" style="width:18px;height:18px;font-size:12px;background:none" data-del-voti="${g}" aria-label="Elimina voti giornata ${g}">×</button></span>`).join('') || '<span class="small muted">Nessuna giornata caricata.</span>'}</div>` : ''}
@@ -743,8 +743,8 @@ function playerForm(id) {
 }
 
 /* ───────── Import voti ───────── */
-async function importFile(file) {
-  if (!window.XLSX) { toast('Lettore Excel non ancora caricato, riprova tra un attimo'); return; }
+// Legge un file voti e lo abbina alla rosa. Non salva niente.
+async function parseFile(file) {
   const d = D();
   const wb = XLSX.read(await file.arrayBuffer(), { type: 'array' });
   const foglio = S.config?.votoFoglio || 'Fantacalcio';
@@ -752,7 +752,7 @@ async function importFile(file) {
   const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
   const titolo = String(rows[0]?.[0] || '') + ' ' + file.name;
   const m = titolo.match(/(\d+)\s*[ªa°º]?\s*giornata/i) || file.name.match(/Giornata[_\s-]*(\d+)/i);
-  let giornata = m ? Number(m[1]) : null;
+  const giornata = m ? Number(m[1]) : null;
   let squadra = '', head = null; const righe = [];
   rows.forEach(r => {
     if (r[0] === 'Cod.') { head = r.map(String); return; }
@@ -761,7 +761,6 @@ async function importFile(file) {
       const o = { Squadra: squadra }; head.forEach((h, i) => o[h.replace('.', '')] = r[i]); righe.push(o);
     }
   });
-  if (!righe.length) { toast('Non trovo voti in questo file'); return; }
 
   // abbinamento con la rosa: prima codice, poi nome (tollera "Taylor" → "Taylor K.")
   const byCod = Object.fromEntries(righe.map(r => [String(r.Cod), r]));
@@ -785,8 +784,28 @@ async function importFile(file) {
   });
   trovati.forEach(t => t.row.FV = fv(t.row));
   const assenti = d.rosa.filter(p => !trovati.some(t => t.p.Id === p.Id));
-  const gia = d.gA.includes(giornata);
+  return { file, foglio, giornata, letti: righe.length, trovati, updates, assenti };
+}
 
+async function importFiles(files) {
+  if (!window.XLSX) { toast('Lettore Excel non ancora caricato, riprova tra un attimo'); return; }
+  if (!S) { toast('Collega prima il foglio (Altro → Collegamento)'); return; }
+  const lista = [];
+  for (const f of files) {
+    try { lista.push(await parseFile(f)); }
+    catch (e) { lista.push({ file: f, errore: 'file non leggibile' }); }
+  }
+  if (lista.length === 1) {
+    const x = lista[0];
+    if (x.errore) { toast('File non leggibile'); return; }
+    if (!x.letti) { toast('Non trovo voti in questo file'); return; }
+    return anteprimaSingola(x);
+  }
+  anteprimaMultipla(lista);
+}
+
+function anteprimaSingola({ file, foglio, giornata, trovati, updates, assenti }) {
+  const gia = D().gA.includes(giornata);
   openSheet(`<div class="panel-head"><div><div class="small muted">${esc(file.name)} · voto ${esc(foglio)}</div><h2>Voti ${giornata ? giornata + 'ª giornata' : ''}</h2></div><button class="x" data-close aria-label="Chiudi">×</button></div>
     <div class="field"><label for="impG">Giornata di Serie A</label><input class="input" id="impG" type="number" min="1" max="38" value="${giornata || ''}"></div>
     ${gia ? '<div class="note" style="margin-bottom:12px">Questa giornata è già caricata: i voti verranno sostituiti.</div>' : ''}
@@ -802,6 +821,55 @@ async function importFile(file) {
       const btn = panel.querySelector('#impSave'); btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Salvo…';
       const ok = await write('importVoti', { giornata: g, rows: trovati.map(t => t.row), rosaUpdates: updates }, `Voti della ${g}ª giornata salvati`);
       if (ok) closeSheet(); else { btn.disabled = false; btn.textContent = 'Salva voti nel foglio'; }
+    };
+  });
+}
+
+// Più file insieme: riepilogo, giornata modificabile, salvataggio in fila dalla più vecchia alla più recente
+function anteprimaMultipla(lista) {
+  const gA = D().gA;
+  lista.sort((a, b) => (a.giornata ?? 99) - (b.giornata ?? 99));
+  const righe = lista.map((x, i) => {
+    if (x.errore || !x.letti) return `<div class="li"><div class="grow"><div class="name">${esc(x.file.name)}</div><div class="sub" style="color:var(--loss)">${x.errore || 'nessun voto trovato'} · verrà saltato</div></div></div>`;
+    return `<div class="li" data-i="${i}"><div class="grow"><div class="name">${esc(x.file.name)}</div>
+      <div class="sub">${x.trovati.length} tuoi giocatori a referto${gA.includes(x.giornata) ? ' · <b>già caricata, verrà sostituita</b>' : ''}</div><div class="sub st"></div></div>
+      <div class="right" style="width:84px"><input class="input g-in" type="number" min="1" max="38" value="${x.giornata || ''}" aria-label="Giornata" style="text-align:center"></div></div>`;
+  }).join('');
+  const validi = lista.filter(x => !x.errore && x.letti);
+  openSheet(`<div class="panel-head"><div><div class="small muted">${lista.length} file · voto ${esc(validi[0]?.foglio || '')}</div><h2>Carica più giornate</h2></div><button class="x" data-close aria-label="Chiudi">×</button></div>
+    <div class="note" style="margin-bottom:12px">Controlla il numero di giornata a destra di ogni file, poi salva: le carico una dopo l'altra.</div>
+    <div class="card"><div class="list">${righe}</div></div>
+    <button class="btn primary block" id="impAll" style="margin-top:14px" ${validi.length ? '' : 'disabled'}>${ICON.save} Salva ${validi.length} giornate nel foglio</button>`,
+  panel => {
+    panel.querySelector('#impAll').onclick = async () => {
+      const job = [];
+      for (const el of panel.querySelectorAll('[data-i]')) {
+        const g = Number(el.querySelector('.g-in').value);
+        if (!g) { toast('Manca il numero di giornata per ' + lista[el.dataset.i].file.name); return; }
+        job.push({ el, g, x: lista[el.dataset.i] });
+      }
+      const doppie = job.map(j => j.g).filter((g, i, a) => a.indexOf(g) !== i);
+      if (doppie.length) { toast(`La ${doppie[0]}ª giornata compare due volte`); return; }
+      job.sort((a, b) => a.g - b.g); // la squadra più recente di ogni giocatore vince
+      const btn = panel.querySelector('#impAll'); btn.disabled = true;
+      panel.querySelectorAll('.g-in').forEach(i => i.disabled = true);
+      syncState.busy = true; renderSync();
+      let fatte = 0, ultimo = null;
+      for (const j of job) {
+        btn.innerHTML = `<span class="spin"></span> Salvo la ${j.g}ª giornata (${fatte + 1} di ${job.length})…`;
+        const st = j.el.querySelector('.st');
+        try {
+          ultimo = await apiPost('importVoti', { giornata: j.g, rows: j.x.trovati.map(t => t.row), rosaUpdates: j.x.updates });
+          fatte++; st.innerHTML = '<span style="color:var(--win)">✓ salvata</span>';
+        } catch (e) {
+          st.innerHTML = `<span style="color:var(--loss)">Errore: ${esc(e.message)}</span>`;
+          break;
+        }
+      }
+      if (ultimo) setData(ultimo);
+      syncState.busy = false; renderSync(); render();
+      if (fatte === job.length) { closeSheet(); toast(`${fatte} giornate salvate`); }
+      else { toast(`Salvate ${fatte} di ${job.length}: riprova con le altre`); btn.textContent = 'Chiudi'; btn.disabled = false; btn.onclick = closeSheet; }
     };
   });
 }
@@ -845,7 +913,7 @@ function bind(root) {
     }
   };
   root.querySelectorAll('[data-act]').forEach(b => b.onclick = () => acts[b.dataset.act]?.());
-  const fileIn = root.querySelector('#fileVoti'); if (fileIn) fileIn.onchange = e => { const f = e.target.files[0]; if (f) importFile(f).catch(err => toast('File non leggibile: ' + err.message)); e.target.value = ''; };
+  const fileIn = root.querySelector('#fileVoti'); if (fileIn) fileIn.onchange = e => { const fs = [...e.target.files]; if (fs.length) importFiles(fs).catch(err => toast('File non leggibile: ' + err.message)); e.target.value = ''; };
   const vf = root.querySelector('#votoFoglio'); if (vf) vf.onchange = e => write('saveConfig', { votoFoglio: e.target.value }, 'Userò il voto ' + e.target.value);
 }
 
