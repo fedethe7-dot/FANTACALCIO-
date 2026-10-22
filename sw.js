@@ -1,5 +1,5 @@
 // Cache dell'interfaccia: i dati arrivano sempre dal foglio (rete), l'app si apre anche offline.
-const CACHE = 'fanta-v1.1.0';
+const CACHE = 'fanta-v1.2.0';
 const FILES = ['./', 'index.html', 'style.css', 'app.js', 'manifest.json', 'icon.svg', 'icon-192.png', 'icon-512.png'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(FILES))); self.skipWaiting(); });
 self.addEventListener('activate', e => {

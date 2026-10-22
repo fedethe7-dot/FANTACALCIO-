@@ -1,7 +1,7 @@
 'use strict';
 /* Fanta 26/27 – app personale per la rosa Mantra. Dati nel foglio Google via Apps Script. */
 
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -217,7 +217,10 @@ function openSheet(html, onMount) {
   const s = $('#sheet');
   s.innerHTML = `<div class="panel" role="dialog" aria-modal="true"><div class="grab"></div>${html}</div>`;
   s.hidden = false; document.body.style.overflow = 'hidden';
-  s.onclick = e => { if (e.target === s || e.target.closest('[data-close]')) closeSheet(); };
+  s.onclick = e => {
+    if (e.target === s || e.target.closest('[data-close]')) return closeSheet();
+    const f = e.target.closest('[data-foto]'); if (f) cambiaFoto(f.dataset.foto);
+  };
   onMount && onMount($('.panel', s));
 }
 function closeSheet() { const s = $('#sheet'); s.hidden = true; s.innerHTML = ''; document.body.style.overflow = ''; }
@@ -251,6 +254,7 @@ function render() {
   main.innerHTML = ({ squadra: vSquadra, formazione: vFormazione, giornate: vGiornate, giocatori: vStatistiche, altro: vAltro }[view] || vSquadra)();
   bind(main);
   renderSync();
+  caricaFoto();
 }
 function renderSync() {
   const el = $('#sync'); if (!el) return;
@@ -265,56 +269,162 @@ function vuoto() {
     <button class="btn primary" data-go="altro">Vai al collegamento</button></div>`;
 }
 
+/* ───────── Foto giocatori (Wikipedia, con link manuale) ───────── */
+const FOTO = LS.get('fc_foto', {});
+const REP_C = { P: 'por', D: 'dif', C: 'cen', A: 'att' };
+const cognome = n => String(n || '').split(/\s+/).filter(w => !/^\p{L}{1,2}\.$/u.test(w)).join(' ') || String(n || '');
+const iniziali = n => cognome(n).split(/\s+/).filter(Boolean).map(w => w[0]).slice(0, 2).join('').toUpperCase();
+const fotoDi = p => p?.Foto || FOTO[p?.Id]?.u || '';
+const imgTag = u => `<img src="${esc(u)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()">`;
+function avatar(p, cls = '') {
+  if (!p) return `<span class="av ${cls}"><i>?</i></span>`;
+  const u = fotoDi(p);
+  return `<span class="av ${cls}" data-av="${esc(p.Id)}" style="--rc:var(--r-${REP_C[p.Reparto] || 'cen'})">${u ? imgTag(u) : ''}<i>${esc(iniziali(p.Nome))}</i></span>`;
+}
+async function cercaFoto(p) {
+  if (!p) return '';
+  const cg = cognome(p.Nome); const key = norm(cg).split(' ').pop();
+  const prove = [['it', `${cg} calciatore ${p.Squadra || ''}`], ['it', `${cg} calciatore`], ['en', `${cg} footballer ${p.Squadra || ''}`]];
+  for (const [lang, q] of prove) {
+    const r = await fetch(`https://${lang}.wikipedia.org/w/api.php?action=query&format=json&origin=*&generator=search&gsrnamespace=0&gsrlimit=5&prop=pageimages&piprop=thumbnail&pithumbsize=400&gsrsearch=${encodeURIComponent(q)}`);
+    if (!r.ok) continue;
+    const j = await r.json();
+    const pages = Object.values(j.query?.pages || {}).sort((a, b) => a.index - b.index);
+    const hit = pages.find(pg => pg.thumbnail && norm(pg.title).includes(key) && !/stagione|season/i.test(pg.title) && !/\.svg/i.test(pg.thumbnail.source));
+    if (hit) return hit.thumbnail.source;
+  }
+  return '';
+}
+const fotoCoda = new Set(); let fotoAttivi = 0;
+function caricaFoto() {
+  if (!S) return;
+  const now = Date.now();
+  (S.rosa || []).forEach(p => {
+    if (!p.Id || p.Foto) return;
+    const c = FOTO[p.Id];
+    if (c && c.n === p.Nome && (c.u || now - c.t < 7 * 864e5)) return;
+    fotoCoda.add(p.Id);
+  });
+  pompaFoto();
+}
+function pompaFoto() {
+  while (fotoAttivi < 3 && fotoCoda.size) {
+    const id = fotoCoda.values().next().value; fotoCoda.delete(id); fotoAttivi++;
+    const p = D().byId[id];
+    cercaFoto(p).then(u => { FOTO[id] = { u, t: Date.now(), n: p?.Nome }; LS.set('fc_foto', FOTO); if (u) mostraFoto(id, u); })
+      .catch(() => {}).finally(() => { fotoAttivi--; pompaFoto(); });
+  }
+}
+function mostraFoto(id, u) {
+  $$('[data-av]').filter(el => el.dataset.av === id).forEach(el => { el.querySelector('img')?.remove(); el.insertAdjacentHTML('afterbegin', imgTag(u)); });
+}
+async function cambiaFoto(id) {
+  const p = D().byId[id]; if (!p) return;
+  const u = prompt(`Incolla il link di una foto di ${p.Nome}\n(tieni premuto sull'immagine → "Copia indirizzo immagine").\nLascia vuoto per tornare alla foto automatica.`, p.Foto || '');
+  if (u === null) return;
+  const link = u.trim();
+  if (link && !/^https:\/\//.test(link)) { toast('Il link deve iniziare con https://'); return; }
+  if (link) FOTO[id] = { u: link, t: Date.now(), n: p.Nome, man: true }; else delete FOTO[id];
+  LS.set('fc_foto', FOTO);
+  const lista = S.rosa.map(x => x.Id === id ? { ...x, Foto: link } : x);
+  if (await write('saveRosa', lista, link ? 'Foto aggiornata' : 'Torno alla foto automatica')) { closeSheet(); playerSheet(id); }
+  else render();
+}
+
 /* ───────── Vista: Squadra ───────── */
 function vSquadra() {
   const d = D(); const c = S.config || {};
-  const ultime = d.giornate.filter(g => g.e).slice(-5);
+  const conE = d.giornate.filter(g => g.e);
+  const ultime = conE.slice(-6);
   const media = avg(d.punti);
-  const top = (k, min = 0, f = s => s[k]) => Object.values(d.st).filter(s => d.byId[s.id] && s.pres >= min && f(s) != null && f(s) > 0).sort((a, b) => f(b) - f(a))[0];
-  const kpi = (label, s, val, sub) => `<button class="card kpi" data-player="${s ? s.id : ''}" style="text-align:left">
-      <span>${label}</span><b>${s ? esc(shortName(d.byId[s.id].Nome)) : '–'}</b><small>${s ? val(s) : sub || 'Nessun dato'}</small></button>`;
+  const pct = conE.length ? Math.round(d.rec.V / conE.length * 100) : 0;
+  const ptsLega = d.rec.V * 3 + d.rec.P;
+  const NOMI = { V: ['vittoria', 'vittorie'], P: ['pareggio', 'pareggi'], S: ['sconfitta', 'sconfitte'] };
+  let streak = '';
+  if (conE.length) { const e0 = conE[conE.length - 1].e; let k = 0; for (let i = conE.length - 1; i >= 0 && conE[i].e === e0; i--) k++; streak = k > 1 ? `${k} ${NOMI[e0][1]} di fila` : `Ultima: ${NOMI[e0][0]}`; }
+  const top = (k, min = 0, f = s => s[k]) => Object.values(d.st).filter(s => d.byId[s.id] && d.byId[s.id].Attivo !== false && s.pres >= min && f(s) != null && f(s) > 0).sort((a, b) => f(b) - f(a))[0];
+  const star = (label, icon, s, val, sub) => { const p = s && d.byId[s.id];
+    return `<button class="star" data-player="${p ? p.Id : ''}">${avatar(p, 'xl')}<span class="star-tag">${icon} ${label}</span>
+      <b>${p ? esc(shortName(p.Nome)) : '–'}</b><small>${p ? val(s) : sub || 'Nessun dato'}</small></button>`; };
   const spesi = sum(d.rosa.map(p => Number(p.Crediti) || 0)); const budget = Number(c.budget) || 300;
   const perRep = ['P', 'D', 'C', 'A'].map(r => ({ r, cr: sum(d.rosa.filter(p => p.Reparto === r).map(p => Number(p.Crediti) || 0)), n: d.rosa.filter(p => p.Reparto === r).length }));
   const last = d.giornate[d.giornate.length - 1];
+  const sq = c.squadra || 'La mia squadra';
+  const crest = sq.split(/\s+/).filter(Boolean).map(w => w[0]).join('').slice(0, 2).toUpperCase();
+  const classifica = d.rosa.map(p => d.st[p.Id]).filter(s => s.pres >= 1 && s.fm != null).sort((a, b) => b.fm - a.fm).slice(0, 5);
+  const maxFm = Math.max(7, ...classifica.map(s => s.fm));
+  const modTop = Object.values(d.moduli).sort((a, b) => b.n - a.n)[0];
+
   return `
   <section class="hero">
-    <div class="lega">${esc(c.lega || 'Fantacalcio Mantra')} · 2026/27</div>
-    <div class="team">${esc(c.squadra || 'La mia squadra')}</div>
-    <div class="record">
-      <div class="pill-stat"><b>${d.rec.V}</b><span>Vinte</span></div>
-      <div class="pill-stat"><b>${d.rec.P}</b><span>Pari</span></div>
-      <div class="pill-stat"><b>${d.rec.S}</b><span>Perse</span></div>
-      <div class="pill-stat"><b>${fmt(media, 1)}</b><span>Media punti</span></div>
+    <div class="hero-top">
+      <div class="crest" aria-hidden="true">${esc(crest)}</div>
+      <div class="hero-id"><div class="lega">${esc(c.lega || 'Fantacalcio Mantra')} · 2026/27</div><div class="team">${esc(sq)}</div></div>
     </div>
-    ${ultime.length ? `<div class="form-strip" aria-label="Ultimi risultati">${ultime.map(g => resBadge(g.e)).join('')}</div>` : ''}
+    <div class="hero-main">
+      <div class="ring" style="--p:${pct}" aria-label="${pct}% di partite vinte"><div><b>${pct}%</b><span>vinte</span></div></div>
+      <div class="hero-stats">
+        <div class="pill-stat"><b>${ptsLega}</b><span>Punti</span></div>
+        <div class="pill-stat"><b>${fmt(media, 1)}</b><span>Media</span></div>
+        <div class="pill-stat"><b>${d.punti.length ? fmt(Math.max(...d.punti), 1) : '–'}</b><span>Record</span></div>
+        <div class="pill-stat wide"><b class="vps"><i class="V">${d.rec.V}</i><i class="P">${d.rec.P}</i><i class="S">${d.rec.S}</i></b><span>V · P · S</span></div>
+      </div>
+    </div>
+    ${ultime.length ? `<div class="hero-form"><div class="form-strip" aria-label="Ultimi risultati">${ultime.map(g => resBadge(g.e)).join('')}</div><span>${streak}</span></div>` : ''}
   </section>
 
-  <div class="head-actions section">
-    <button class="btn primary" data-act="nuova-giornata">${ICON.plus} Registra partita</button>
-    <button class="btn" data-go="altro" data-scroll="import">${ICON.up} Carica voti</button>
-    <button class="btn" data-go="formazione">${ICON.wand} Chi schiero?</button>
+  <div class="quick section">
+    <button class="qa primary" data-act="nuova-giornata"><span class="qi">${ICON.plus}</span><b>Registra</b><small>nuova partita</small></button>
+    <button class="qa" data-go="formazione"><span class="qi">${ICON.wand}</span><b>Chi schiero?</b><small>${modTop ? 'di solito ' + esc(modTop.m) : 'undici consigliato'}</small></button>
+    <button class="qa" data-go="altro" data-scroll="import"><span class="qi">${ICON.up}</span><b>Carica voti</b><small>${d.ultimaA ? 'ultima: ' + d.ultimaA + 'ª' : 'file fantacalcio.it'}</small></button>
   </div>
 
-  <div class="section"><h3>In evidenza</h3>
-  <div class="grid grid-3">
-    ${kpi('Capocannoniere', top('gol'), s => `${s.gol} gol in ${s.pres} ${s.pres === 1 ? 'presenza' : 'presenze'}`)}
-    ${kpi('Assistman', top('ass'), s => `${s.ass} assist`)}
-    ${kpi('Miglior fantamedia', top('fm', 2), s => `FM ${fmt(s.fm)} · MV ${fmt(s.mv)}`, 'Servono almeno 2 presenze')}
-    ${kpi('Più in forma', top('forma', 2), s => `Ultime 3: ${fmt(s.forma)}`, 'Servono almeno 2 presenze')}
-    ${kpi('Più volte migliore', top('migl'), s => `${s.migl} ${s.migl === 1 ? 'volta' : 'volte'} su ${d.giornate.length}`)}
-    ${kpi('Più volte peggiore', top('pegg'), s => `${s.pegg} ${s.pegg === 1 ? 'volta' : 'volte'} su ${d.giornate.length}`)}
+  ${last ? `<div class="section"><h3>Ultima partita</h3>${spotlight(last)}</div>` : ''}
+
+  <div class="section"><h3>I protagonisti</h3>
+  <div class="stars">
+    ${star('Bomber', '⚽', top('gol'), s => `${s.gol} gol · ${s.pres} pres.`)}
+    ${star('Assistman', '🎯', top('ass'), s => `${s.ass} assist`)}
+    ${star('Fantamedia', '⭐', top('fm', 2), s => `FM ${fmt(s.fm)}`, 'Min. 2 presenze')}
+    ${star('In forma', '🔥', top('forma', 2), s => `Ultime 3: ${fmt(s.forma)}`, 'Min. 2 presenze')}
+    ${star('MVP', '🏆', top('migl'), s => `${s.migl} ${s.migl === 1 ? 'volta' : 'volte'} migliore`)}
+    ${star('Flop', '👎', top('pegg'), s => `${s.pegg} ${s.pegg === 1 ? 'volta' : 'volte'} peggiore`)}
   </div></div>
 
   <div class="grid grid-2 section">
-    <div class="card"><div class="card-head"><h3>Punteggi</h3><span class="chip">${d.punti.length} partite</span></div>${chartPunteggi(d.giornate)}</div>
-    <div class="card"><div class="card-head"><h3>Crediti</h3><span class="chip ${budget - spesi >= 0 ? 'ok' : 'warn'}">${budget - spesi} rimasti</span></div>
-      <div class="kpi" style="margin-bottom:14px"><b>${spesi}<span class="muted" style="font-size:18px"> / ${budget}</span></b></div>
-      ${perRep.map(x => `<div style="margin-bottom:10px"><div class="split small"><span>${REPARTI[x.r]} <span class="muted">(${x.n})</span></span><b class="num">${x.cr}</b></div>
-        <div class="bar"><i style="width:${Math.round(x.cr / Math.max(1, spesi) * 100)}%;background:var(--r-${{ P: 'por', D: 'dif', C: 'cen', A: 'att' }[x.r]})"></i></div></div>`).join('')}
+    <div class="card"><div class="card-head"><h3>Top 5 fantamedia</h3><button class="chip" data-go="giocatori">Tutti →</button></div>
+      ${classifica.length ? `<div class="list">${classifica.map((s, i) => { const p = d.byId[s.id]; return `<button class="li rank" data-player="${p.Id}">
+        <span class="pos num">${i + 1}</span>${avatar(p)}<div class="grow"><div class="name">${esc(p.Nome)}</div>
+        <div class="bar"><i style="width:${Math.max(6, Math.min(100, (s.fm - 4) / (maxFm - 4) * 100))}%;background:var(--r-${REP_C[p.Reparto] || 'cen'})"></i></div></div>
+        <span class="heat" style="${heat(s.fm)}">${fmt(s.fm)}</span></button>`; }).join('')}</div>` : '<div class="empty-state small">Carica i voti per vedere la classifica.</div>'}
     </div>
+    <div class="card"><div class="card-head"><h3>Punteggi</h3><span class="chip">${d.punti.length} partite</span></div>${chartPunteggi(d.giornate)}</div>
   </div>
 
-  ${last ? `<div class="section"><h3>Ultima partita</h3>${giornataCard(last)}</div>` : ''}`;
+  <div class="card section"><div class="card-head"><h3>Crediti</h3><span class="chip ${budget - spesi >= 0 ? 'ok' : 'warn'}">${budget - spesi} rimasti</span></div>
+    <div class="kpi" style="margin-bottom:12px"><b>${spesi}<span class="muted" style="font-size:18px"> / ${budget}</span></b></div>
+    <div class="stack">${perRep.map(x => `<i style="flex:${x.cr || 0.001};background:var(--r-${REP_C[x.r]})" title="${REPARTI[x.r]}: ${x.cr}"></i>`).join('')}${budget > spesi ? `<i style="flex:${budget - spesi};background:var(--surface-2)"></i>` : ''}</div>
+    <div class="legend">${perRep.map(x => `<span><i style="background:var(--r-${REP_C[x.r]})"></i>${REPARTI[x.r]} <b class="num">${x.cr}</b> <span class="muted">(${x.n})</span></span>`).join('')}</div>
+  </div>`;
+}
+
+function spotlight(g) {
+  const d = D();
+  const pl = (id, lab, cls) => { const p = d.byId[id]; if (!p) return '';
+    const v = g.A != null ? d.votoDi(id, g.A) : null;
+    return `<div class="sp-pl ${cls}" data-player="${p.Id}" role="button" tabindex="0">${avatar(p, 'lg')}<div style="min-width:0"><span class="sp-lab">${lab}</span>
+      <div class="name">${esc(shortName(p.Nome))}</div>${v && v.FV != null ? `<span class="small muted">FV ${fmt(v.FV, v.FV % 1 ? 1 : 0)}</span>` : ''}</div></div>`; };
+  const col = { V: 'win', P: 'draw', S: 'loss' }[g.e] || 'ink-3';
+  return `<div class="spot" style="--ec:var(--${col})">
+    <button class="spot-head" data-giornata="${g.n}">
+      ${g.e ? resBadge(g.e, 'lg') : '<span class="res lg" style="background:var(--surface-2);color:var(--ink-3)">?</span>'}
+      <div style="flex:1;min-width:0"><div class="small muted">Partita ${g.n}${g.A ? ` · ${g.A}ª Serie A` : ''}${g.F?.modulo || g.Modulo ? ` · ${esc(g.F?.modulo || g.Modulo)}` : ''}</div>
+        <div class="spot-title">${g.Avversario ? 'vs ' + esc(g.Avversario) : ({ V: 'Vittoria', P: 'Pareggio', S: 'Sconfitta' }[g.e] || 'Partita')}</div></div>
+      <div class="spot-score"><b>${g.pt != null ? fmt(g.pt, g.pt % 1 ? 1 : 0) : '–'}</b>${g.PuntiAvv !== '' && g.PuntiAvv != null ? `<span>${fmt(Number(g.PuntiAvv), Number(g.PuntiAvv) % 1 ? 1 : 0)} avv.</span>` : ''}</div>
+    </button>
+    ${g.Migliore || g.Peggiore ? `<div class="sp-row">${pl(g.Migliore, '★ Migliore', 'best')}${pl(g.Peggiore, '▼ Peggiore', 'worst')}</div>` : ''}
+    ${g.Marcatori ? `<div class="tag-line" style="margin-top:12px">${g.Marcatori.split(',').map(x => x.trim()).filter(Boolean).map(x => `<span class="chip">⚽ ${esc(x)}</span>`).join('')}</div>` : ''}
+  </div>`;
 }
 
 function chartPunteggi(gs) {
@@ -328,10 +438,13 @@ function chartPunteggi(gs) {
   const ticks = []; for (let t = lo; t <= hi; t += Math.max(5, Math.round((hi - lo) / 4 / 5) * 5)) ticks.push(t);
   const m = avg(vals);
   const col = e => `var(--${{ V: 'win', P: 'draw', S: 'loss' }[e] || 'ink-3'})`;
+  const gid = 'ga' + Math.random().toString(36).slice(2, 7);
   return `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="Punteggio per partita">
     ${ticks.map(t => `<line class="grid-l" x1="${pl}" x2="${W - pr}" y1="${y(t)}" y2="${y(t)}"/><text class="ax" x="${pl - 6}" y="${y(t) + 4}" text-anchor="end">${t}</text>`).join('')}
     <line x1="${pl}" x2="${W - pr}" y1="${y(m)}" y2="${y(m)}" stroke="var(--ink-3)" stroke-dasharray="4 4"/>
     <text class="ax" x="${W - pr}" y="${y(m) - 5}" text-anchor="end">media ${fmt(m, 1)}</text>
+    <defs><linearGradient id="${gid}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--accent)" stop-opacity=".35"/><stop offset="1" stop-color="var(--accent)" stop-opacity="0"/></linearGradient></defs>
+    ${pts.length > 1 ? `<polygon fill="url(#${gid})" points="${x(0)},${H - pb} ${pts.map((g, i) => `${x(i)},${y(g.pt)}`).join(' ')} ${x(pts.length - 1)},${H - pb}"/>` : ''}
     <polyline fill="none" stroke="var(--accent)" stroke-width="2.5" stroke-linejoin="round" points="${pts.map((g, i) => `${x(i)},${y(g.pt)}`).join(' ')}"/>
     ${pts.map((g, i) => `<circle cx="${x(i)}" cy="${y(g.pt)}" r="6" fill="${col(g.e)}" stroke="var(--surface)" stroke-width="2"><title>Partita ${g.n}: ${g.pt}</title></circle>
       <text class="lbl" x="${x(i)}" y="${y(g.pt) - 11}" text-anchor="middle">${fmt(g.pt, g.pt % 1 ? 1 : 0)}</text>
@@ -369,7 +482,7 @@ function pitchHTML(F, opts = {}) {
       if (s.forma != null && s.pres >= 2) badge = `<span class="fv ${s.forma >= 7 ? 'good' : s.forma < 6 ? 'bad' : ''}" title="Forma ultime 3">${fmt(s.forma, 1)}</span>`;
     }
     return `<button class="slot ${p ? '' : 'empty'} ${off ? 'off' : ''} ${opts.sel === i ? 'sel' : ''}" ${opts.readonly ? 'disabled style="cursor:default"' : ''} data-slot="${i}" aria-label="${slotLabel(r)}: ${p ? esc(p.Nome) : 'vuoto'}">
-      <span class="shirt">${p ? num : '+'}${badge}</span>
+      <span class="shirt">${p ? `${avatar(p, 'fill')}<b class="val">${num}</b>` : '+'}${badge}</span>
       <span class="lbl">${p ? esc(shortName(p.Nome)) : '&nbsp;'}</span>
       <span class="slot-role">${slotLabel(r)}${off ? ' ⚠' : ''}</span></button>`;
   }).join('')}</div>`).join('');
@@ -390,7 +503,7 @@ function pickerHTML(F, i) {
   const ord = (a, b) => d.st[b.Id].score - d.st[a.Id].score;
   const ok = d.rosa.filter(p => compat(p, r)).sort(ord), ko = d.rosa.filter(p => !compat(p, r)).sort(ord);
   const row = p => { const s = d.st[p.Id]; return `<button class="li" data-pick="${p.Id}">
-      ${roleBadges(p)}<div class="grow"><div class="name">${esc(p.Nome)}${inCampo.has(p.Id) ? ' <span class="chip">in campo</span>' : ''}</div>
+      ${avatar(p)}<div class="grow"><div class="name">${esc(p.Nome)} ${roleBadges(p)}${inCampo.has(p.Id) ? ' <span class="chip">in campo</span>' : ''}</div>
       <div class="sub">${esc(p.Squadra || '')} · ${s.pres} pres.${s.saltataUltima && d.ultimaA ? ' · <span style="color:var(--draw)">non a referto l\'ultima</span>' : ''}</div></div>
       <div class="right"><div class="big">${fmt(s.fm, 2)}</div><div class="sub">forma ${fmt(s.forma, 1)}</div></div></button>`; };
   return `<div class="card" style="margin-top:14px"><div class="card-head"><h3>Posto ${slotLabel(r)}</h3>
@@ -431,7 +544,7 @@ function vFormazione() {
       <div class="tag-line" style="margin-top:10px">
         <span class="chip ${pieni === 11 ? 'ok' : ''}">${pieni}/11 schierati</span>
         ${fuori.length ? `<span class="chip warn">⚠ Fuori ruolo: ${fuori.map(esc).join(', ')}</span>` : ''}
-        <span class="chip">Nel cerchio: fantamedia · badge: forma ultime 3</span>
+        <span class="chip">Sotto la foto: fantamedia · badge: forma ultime 3</span>
       </div>
       ${ui.formSel != null ? pickerHTML(F, ui.formSel) : ''}
     </div>
@@ -444,8 +557,8 @@ function vFormazione() {
         <div class="small muted" style="margin-top:8px">Tocca un modulo per caricare l'undici migliore in quel modulo.</div>
       </div>
       <div class="card"><div class="card-head"><h3>Panchina</h3><span class="chip">${panchina.length}</span></div>
-        <div class="list">${panchina.map(p => { const s = d.st[p.Id]; return `<button class="li" data-player="${p.Id}">${roleBadges(p)}
-          <div class="grow"><div class="name">${esc(p.Nome)}</div><div class="sub">${esc(p.Squadra || '')} · ${s.pres} pres.</div></div>
+        <div class="list">${panchina.map(p => { const s = d.st[p.Id]; return `<button class="li" data-player="${p.Id}">${avatar(p)}
+          <div class="grow"><div class="name">${esc(p.Nome)} ${roleBadges(p)}</div><div class="sub">${esc(p.Squadra || '')} · ${s.pres} pres.</div></div>
           <div class="right"><div class="big">${fmt(s.fm, 2)}</div><div class="sub">forma ${fmt(s.forma, 1)}</div></div></button>`; }).join('')}</div></div>
     </div>
   </div>`;
@@ -471,11 +584,11 @@ function giornataDettaglio(n) {
       <div class="small muted">${esc(g.F?.modulo || g.Modulo || 'Modulo non registrato')}</div></div></div>
     ${g.F?.slot?.some(Boolean) ? pitchHTML(g.F, { readonly: true, A: g.A }) + (g.A == null ? '<div class="note" style="margin-top:8px">Collega la giornata di Serie A per vedere i voti in campo.</div>' : '') : '<div class="note">Formazione non registrata per questa partita.</div>'}
     <div class="grid grid-2" style="margin-top:14px">
-      <div class="card"><h3>Migliore</h3><div style="font-weight:700;font-size:18px">★ ${nm(g.Migliore)}</div></div>
-      <div class="card"><h3>Peggiore</h3><div style="font-weight:700;font-size:18px">▼ ${nm(g.Peggiore)}</div></div>
+      <div class="card"><h3>Migliore</h3><div class="pname" style="font-size:18px">${avatar(d.byId[g.Migliore], 'lg')} ★ ${nm(g.Migliore)}</div></div>
+      <div class="card"><h3>Peggiore</h3><div class="pname" style="font-size:18px">${avatar(d.byId[g.Peggiore], 'lg')} ▼ ${nm(g.Peggiore)}</div></div>
     </div>
     ${g.Marcatori ? `<div class="card" style="margin-top:14px"><h3>Marcatori</h3>⚽ ${esc(g.Marcatori)}</div>` : ''}
-    ${voti.length ? `<div class="card" style="margin-top:14px"><h3>Pagelle</h3><div class="list">${voti.sort((a, b) => (b.v?.FV ?? -1) - (a.v?.FV ?? -1)).map(({ p, v }) => `<div class="li">${roleBadges(p)}<div class="grow"><div class="name">${esc(p.Nome)}</div><div class="sub">${v ? bonusTxt(v) : 'Non a referto'}</div></div>
+    ${voti.length ? `<div class="card" style="margin-top:14px"><h3>Pagelle</h3><div class="list">${voti.sort((a, b) => (b.v?.FV ?? -1) - (a.v?.FV ?? -1)).map(({ p, v }) => `<div class="li">${avatar(p)}<div class="grow"><div class="name">${esc(p.Nome)} ${roleBadges(p)}</div><div class="sub">${v ? bonusTxt(v) : 'Non a referto'}</div></div>
       <div class="right"><span class="heat" style="${heat(v?.FV)}">${v ? (v.FV == null ? 'sv' : fmt(v.FV, 1)) : '–'}</span><div class="sub">voto ${v ? esc(v.Voto) : '–'}</div></div></div>`).join('')}</div></div>` : ''}
     ${g.Note ? `<div class="note" style="margin-top:14px">${esc(g.Note)}</div>` : ''}
     <div class="row" style="margin-top:16px"><button class="btn danger" data-del-giornata="${g.n}">Elimina</button><button class="btn primary" data-edit-giornata="${g.n}">Modifica</button></div>`,
@@ -601,7 +714,7 @@ function stGiocatori() {
   return `<div class="card">
     <div class="card-head"><div class="seg">${[['T', 'Tutti'], ['P', 'Por'], ['D', 'Dif'], ['C', 'Cen'], ['A', 'Att']].map(([k, l]) => `<button data-rep="${k}" aria-pressed="${ui.rep === k}">${l}</button>`).join('')}</div></div>
     <div class="table-wrap"><table class="t"><thead><tr><th>Giocatore</th>${cols.map(([k, l]) => `<th data-sort="${k}" ${ui.sortKey === k ? 'aria-sort="' + (ui.sortDir < 0 ? 'descending' : 'ascending') + '"' : ''}>${l}${ui.sortKey === k ? (ui.sortDir < 0 ? ' ↓' : ' ↑') : ''}</th>`).join('')}</tr></thead>
-    <tbody>${rows.map(s => { const p = d.byId[s.id]; return `<tr data-player="${p.Id}"><td><span class="pname">${roleBadges(p)} ${esc(p.Nome)}</span></td>${cols.map(([, , f]) => `<td>${f(s)}</td>`).join('')}</tr>`; }).join('')}</tbody></table></div>
+    <tbody>${rows.map(s => { const p = d.byId[s.id]; return `<tr data-player="${p.Id}"><td><span class="pname">${avatar(p, 'sm')} ${esc(p.Nome)} ${roleBadges(p)}</span></td>${cols.map(([, , f]) => `<td>${f(s)}</td>`).join('')}</tr>`; }).join('')}</tbody></table></div>
     <div class="small muted" style="margin-top:10px">Pres = partite a voto in Serie A · Tit = volte titolare nella tua squadra · FM = fantamedia · Forma = media ultime 3 · ★/▼ = migliore/peggiore della tua squadra · Bonus = somma bonus/malus.</div>
   </div>`;
 }
@@ -612,7 +725,7 @@ function stRuoli() {
     if (!ps.length) return '';
     return `<div class="card"><div class="card-head"><h3><span class="role ${RUOLI[r].c}">${RUOLI[r].l}</span></h3><span class="chip">${ps.length}</span></div>
       ${ps.map((p, i) => { const s = d.st[p.Id]; const eff = Object.entries(s.pos).filter(([lab]) => lab.split('/').includes(RUOLI[r].l)).flatMap(([, e]) => e.fv);
-        return `<button class="sugg li" data-player="${p.Id}"><span class="num pos" style="font-size:18px;font-weight:800;color:${i ? 'var(--ink-3)' : 'var(--accent)'}">${i + 1}</span>
+        return `<button class="sugg li" data-player="${p.Id}"><span class="num pos" style="font-size:18px;font-weight:800;color:${i ? 'var(--ink-3)' : 'var(--accent)'}">${i + 1}</span>${avatar(p)}
         <div class="grow"><div class="name">${esc(p.Nome)}</div><div class="sub">FM ${fmt(s.fm)} · forma ${fmt(s.forma, 1)}${eff.length ? ` · da titolare qui: ${fmt(avg(eff), 1)} (${eff.length})` : ''}${s.saltataUltima && d.ultimaA ? ' · <span style="color:var(--draw)">fuori l\'ultima</span>' : ''}</div></div>
         <div class="bar" style="width:70px"><i style="width:${Math.max(4, Math.min(100, (s.score - 4) / 5 * 100))}%"></i></div></button>`; }).join('')}</div>`;
   }).join('');
@@ -650,7 +763,7 @@ function stSquadra() {
 function playerSheet(id) {
   const d = D(); const p = d.byId[id]; if (!p) return;
   const s = d.st[id]; const vs = d.votiP[id] || [];
-  openSheet(`<div class="panel-head"><div><div style="display:flex;gap:8px;align-items:center">${roleBadges(p)}<span class="small muted">${esc(p.Squadra || '')} · ${esc(p.Crediti)} crediti</span></div><h2>${esc(p.Nome)}</h2></div><button class="x" data-close aria-label="Chiudi">×</button></div>
+  openSheet(`<div class="panel-head"><div class="ps-head"><button class="av-btn" data-foto="${p.Id}" aria-label="Cambia foto">${avatar(p, 'xxl')}<span class="av-edit">✎</span></button><div style="min-width:0"><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">${roleBadges(p)}<span class="small muted">${esc(p.Squadra || '')} · ${esc(p.Crediti)} crediti</span></div><h2>${esc(p.Nome)}</h2></div></div><button class="x" data-close aria-label="Chiudi">×</button></div>
     <div class="grid grid-4">
       <div class="card kpi"><span>Presenze</span><b>${s.pres}</b>${s.sv ? `<small>${s.sv} s.v.</small>` : ''}</div>
       <div class="card kpi"><span>Fantamedia</span><b>${fmt(s.fm)}</b><small>MV ${fmt(s.mv)}</small></div>
@@ -702,7 +815,7 @@ function vAltro() {
     </div>
 
     ${S ? `<div class="card"><div class="card-head"><h3>Rosa</h3><button class="btn small" data-act="nuovo-giocatore">${ICON.plus} Aggiungi</button></div>
-      <div class="list">${['P', 'D', 'C', 'A'].map(r => d.tutti.filter(p => p.Reparto === r).map(p => `<button class="li" data-edit-player="${p.Id}" style="${p.Attivo === false || p.Attivo === 'FALSE' ? 'opacity:.45' : ''}">${roleBadges(p)}<div class="grow"><div class="name">${esc(p.Nome)}</div><div class="sub">${esc(p.Squadra || '')}${p.Cod ? '' : ' · codice non ancora collegato'}</div></div><span class="num" style="font-weight:700">${esc(p.Crediti)}</span></button>`).join('')).join('')}</div></div>
+      <div class="list">${['P', 'D', 'C', 'A'].map(r => d.tutti.filter(p => p.Reparto === r).map(p => `<button class="li" data-edit-player="${p.Id}" style="${p.Attivo === false || p.Attivo === 'FALSE' ? 'opacity:.45' : ''}">${avatar(p)}<div class="grow"><div class="name">${esc(p.Nome)} ${roleBadges(p)}</div><div class="sub">${esc(p.Squadra || '')}${p.Cod ? '' : ' · codice non ancora collegato'}</div></div><span class="num" style="font-weight:700">${esc(p.Crediti)}</span></button>`).join('')).join('')}</div></div>
 
     <div class="card"><h3>Lega</h3>
       <div class="row"><div class="field"><label for="cSq">Squadra</label><input class="input" id="cSq" value="${esc(c.squadra || '')}"></div>
