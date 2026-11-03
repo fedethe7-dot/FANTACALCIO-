@@ -1,7 +1,7 @@
 'use strict';
 /* Fanta 26/27 – app personale per la rosa Mantra. Dati nel foglio Google via Apps Script. */
 
-const VERSION = '1.2.0';
+const VERSION = '1.3.0';
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -21,6 +21,7 @@ const RUOLI = {
   T: { l: 'T', c: 'tre' }, A: { l: 'A', c: 'att' }, PC: { l: 'Pc', c: 'att' }
 };
 const ORDINE_RUOLI = ['P', 'DS', 'DC', 'DD', 'E', 'M', 'C', 'W', 'T', 'A', 'PC'];
+const RUOLO_NOME = { P: 'Portiere', DS: 'Difensore sinistro', DC: 'Difensore centrale', DD: 'Difensore destro', E: 'Esterno', M: 'Mediano', C: 'Centrocampista', W: 'Ala', T: 'Trequartista', A: 'Attaccante', PC: 'Punta centrale' };
 const P = ['P'], DS = ['DS'], DC = ['DC'], DD = ['DD'];
 // Ogni modulo: linee dal portiere all'attacco, ogni posto = ruoli ammessi (da sinistra a destra)
 const MODULI = {
@@ -48,7 +49,7 @@ const DEFAULT_BONUS = { gol: 3, rigore: 3, rigoreSbagliato: -3, rigoreParato: 3,
 let S = LS.get('fc_data', null);
 let API = LS.get('fc_api', { url: '', key: '' });
 let view = LS.get('fc_view', 'squadra');
-const ui = { statTab: 'giocatori', sortKey: 'fm', sortDir: -1, rep: 'T', formSel: null, editForm: null, theme: LS.get('fc_theme', 'auto') };
+const ui = { statTab: 'giocatori', sortKey: 'fm', sortDir: -1, rep: 'T', ruolo: 'tutti', formSel: null, editForm: null, theme: LS.get('fc_theme', 'auto') };
 let syncState = { busy: false, last: LS.get('fc_last', null), error: null };
 let _D = null, _Dkey = null;
 
@@ -128,7 +129,7 @@ function D() {
       amm: sum(vs.map(v => Number(v.Amm) || 0)), esp: sum(vs.map(v => Number(v.Esp) || 0)),
       gs: sum(vs.map(v => Number(v.Gs) || 0)), rp: sum(vs.map(v => Number(v.Rp) || 0)), rs: sum(vs.map(v => Number(v.Rs) || 0)),
       bonus: sum(giocate.map(v => v.FV - Number(v.Voto))),
-      saltataUltima: ultimaA != null && !giocate.some(v => v.G === ultimaA),
+      saltataUltima: ultimaA != null && !vs.some(v => v.G === ultimaA),
       tit: 0, migl: 0, pegg: 0, pos: {}, titFV: [], crediti: Number(p.Crediti) || 0
     };
   });
@@ -228,11 +229,11 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('#sheet
 const shortName = n => { const s = String(n || ''); return s.length > 11 ? s.split(' ')[0] : s; };
 function heat(x) {
   if (x == null) return 'background:var(--surface-2);color:var(--ink-3)';
-  if (x >= 7.5) return 'background:color-mix(in srgb,var(--win) 85%,transparent);color:#fff';
+  if (x >= 7.5) return 'background:color-mix(in srgb,var(--win) 85%,transparent);color:var(--on-strong)';
   if (x >= 6.75) return 'background:color-mix(in srgb,var(--win) 35%,transparent)';
   if (x >= 6) return 'background:var(--surface-2)';
   if (x >= 5.5) return 'background:color-mix(in srgb,var(--loss) 30%,transparent)';
-  return 'background:color-mix(in srgb,var(--loss) 80%,transparent);color:#fff';
+  return 'background:color-mix(in srgb,var(--loss) 80%,transparent);color:var(--on-strong)';
 }
 const resBadge = (e, cls = '') => e ? `<span class="res ${e} ${cls}" title="${{ V: 'Vittoria', P: 'Pareggio', S: 'Sconfitta' }[e]}">${e}</span>` : '';
 const ICON = {
@@ -240,7 +241,8 @@ const ICON = {
   up: '<svg viewBox="0 0 24 24"><path d="M12 16V4M6 10l6-6 6 6M4 20h16"/></svg>',
   sync: '<svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14.3-4.9L4 8M4 4v4h4M4 13a8 8 0 0 0 14.3 4.9L20 16M20 20v-4h-4"/></svg>',
   wand: '<svg viewBox="0 0 24 24"><path d="m15 4 1 2 2 1-2 1-1 2-1-2-2-1 2-1zM4 20l11-11M18 13l.7 1.3L20 15l-1.3.7L18 17l-.7-1.3L16 15l1.3-.7z"/></svg>',
-  save: '<svg viewBox="0 0 24 24"><path d="M5 4h11l3 3v13H5zM8 4v5h7M8 20v-6h8v6"/></svg>'
+  save: '<svg viewBox="0 0 24 24"><path d="M5 4h11l3 3v13H5zM8 4v5h7M8 20v-6h8v6"/></svg>',
+  check: '<svg viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg>'
 };
 
 /* ───────── Router ───────── */
@@ -718,19 +720,58 @@ function stGiocatori() {
     <div class="small muted" style="margin-top:10px">Pres = partite a voto in Serie A · Tit = volte titolare nella tua squadra · FM = fantamedia · Forma = media ultime 3 · ★/▼ = migliore/peggiore della tua squadra · Bonus = somma bonus/malus.</div>
   </div>`;
 }
+// Quadratini con i fantavoti delle ultime 5 giornate di Serie A caricate
+function ultime5(id) {
+  const d = D(); const vs = d.votiP[id] || [];
+  return `<span class="f5" aria-label="Ultime 5 giornate">${d.gA.slice(-5).map(g => {
+    const v = vs.find(x => x.G === g);
+    if (!v) return `<i class="no" title="${g}ª: non a referto">–</i>`;
+    if (v.FV == null) return `<i class="no" title="${g}ª: senza voto">sv</i>`;
+    return `<i style="${heat(v.FV)}" title="${g}ª: ${fmt(v.FV, 1)}">${fmt(v.FV, v.FV % 1 ? 1 : 0)}</i>`;
+  }).join('')}</span>`;
+}
+const trend = s => s.pres < 2 || s.forma == null ? '' : s.forma - s.fm >= 0.3 ? '<span class="tr up" title="In crescita">▲</span>' : s.forma - s.fm <= -0.3 ? '<span class="tr down" title="In calo">▼</span>' : '';
+
 function stRuoli() {
   const d = D();
-  const blocchi = ORDINE_RUOLI.map(r => {
-    const ps = d.rosa.filter(p => ruoliDi(p).includes(r)).sort((a, b) => d.st[b.Id].score - d.st[a.Id].score);
-    if (!ps.length) return '';
-    return `<div class="card"><div class="card-head"><h3><span class="role ${RUOLI[r].c}">${RUOLI[r].l}</span></h3><span class="chip">${ps.length}</span></div>
-      ${ps.map((p, i) => { const s = d.st[p.Id]; const eff = Object.entries(s.pos).filter(([lab]) => lab.split('/').includes(RUOLI[r].l)).flatMap(([, e]) => e.fv);
-        return `<button class="sugg li" data-player="${p.Id}"><span class="num pos" style="font-size:18px;font-weight:800;color:${i ? 'var(--ink-3)' : 'var(--accent)'}">${i + 1}</span>${avatar(p)}
-        <div class="grow"><div class="name">${esc(p.Nome)}</div><div class="sub">FM ${fmt(s.fm)} · forma ${fmt(s.forma, 1)}${eff.length ? ` · da titolare qui: ${fmt(avg(eff), 1)} (${eff.length})` : ''}${s.saltataUltima && d.ultimaA ? ' · <span style="color:var(--draw)">fuori l\'ultima</span>' : ''}</div></div>
-        <div class="bar" style="width:70px"><i style="width:${Math.max(4, Math.min(100, (s.score - 4) / 5 * 100))}%"></i></div></button>`; }).join('')}</div>`;
-  }).join('');
-  return `<div class="note" style="margin-bottom:14px">Per ogni ruolo Mantra, i tuoi giocatori in ordine di indice di rendimento (45% fantamedia stagionale + 55% forma ultime 3, con penalità se non erano a referto nell'ultima giornata caricata). "Da titolare qui" = fantavoto medio quando l'hai schierato in quel ruolo.</div>
-    <div class="grid grid-3">${blocchi}</div>`;
+  const ordina = (a, b) => (d.st[b.Id].pres > 0) - (d.st[a.Id].pres > 0) || d.st[b.Id].score - d.st[a.Id].score;
+  const ruoli = ORDINE_RUOLI.map(r => ({ r, ps: d.rosa.filter(p => ruoliDi(p).includes(r)).sort(ordina) })).filter(x => x.ps.length);
+  if (!ruoli.length) return '<div class="card empty-state"><b>Nessun giocatore</b>Aggiungi la rosa in Altro.</div>';
+  if (ui.ruolo !== 'tutti' && !ruoli.some(x => x.r === ui.ruolo)) ui.ruolo = 'tutti';
+  const scelti = ui.ruolo === 'tutti' ? ruoli : ruoli.filter(x => x.r === ui.ruolo);
+
+  const riga = (p, i, r) => {
+    const s = d.st[p.Id];
+    const qui = Object.entries(s.pos).filter(([lab]) => lab.split('/').includes(RUOLI[r].l)).flatMap(([, e]) => e.fv);
+    const prev = s.pres ? s.score : null;
+    const tags = [
+      qui.length ? `<span class="tag">In questo ruolo: <b>${fmt(avg(qui), 1)}</b> (${qui.length}×)</span>` : '',
+      s.saltataUltima && d.ultimaA && (d.votiP[p.Id] || []).length ? `<span class="tag warn">Non a referto la ${d.ultimaA}ª</span>` : ''
+    ].join('');
+    return `<button class="rk ${i === 0 && prev != null ? 'top' : ''}" data-player="${p.Id}">
+      <span class="rk-pos num">${i + 1}</span>${avatar(p)}
+      <span class="rk-main">
+        <span class="rk-name">${esc(p.Nome)}</span>
+        <span class="rk-sub">${esc(p.Squadra || '')}${s.pres ? ` · FM ${fmt(s.fm)} ${trend(s)}` : ' · ancora nessun voto'}</span>
+        ${d.gA.length ? ultime5(p.Id) : ''}
+        ${tags ? `<span class="rk-tags">${tags}</span>` : ''}
+      </span>
+      <span class="rk-score"><b class="num" style="${heat(prev)}">${prev == null ? '–' : fmt(prev, 1)}</b><small>previsto</small></span>
+    </button>`;
+  };
+
+  return `<div class="rpick" role="tablist" aria-label="Ruolo">
+      <button class="all" data-ruolo="tutti" aria-pressed="${ui.ruolo === 'tutti'}">Tutti</button>
+      ${ruoli.map(x => `<button data-ruolo="${x.r}" aria-pressed="${ui.ruolo === x.r}"><span class="role ${RUOLI[x.r].c}">${RUOLI[x.r].l}</span>${x.ps.length}</button>`).join('')}
+    </div>
+    <details class="info"><summary>Come si legge?</summary>
+      <ul><li><b>Numero a destra</b> = fantavoto previsto: mix di fantamedia (45%) e forma delle ultime 3 (55%), un po' più basso se non era a referto l'ultima giornata.</li>
+      <li><b>Quadratini</b> = fantavoti delle ultime 5 giornate (– non a referto, sv senza voto).</li>
+      <li><b>▲ ▼</b> = in crescita o in calo rispetto alla sua media.</li>
+      <li><b>In questo ruolo</b> = fantavoto medio quando l'hai schierato lì.</li></ul></details>
+    <div class="grid grid-2">${scelti.map(({ r, ps }) => `<div class="card rk-card">
+      <div class="card-head"><div class="rk-title"><span class="role lg ${RUOLI[r].c}">${RUOLI[r].l}</span><b>${RUOLO_NOME[r]}</b></div><span class="chip">${ps.length}</span></div>
+      ${ps.map((p, i) => riga(p, i, r)).join('')}</div>`).join('')}</div>`;
 }
 function stModuli() {
   const d = D();
@@ -800,8 +841,8 @@ function vAltro() {
   <div class="grid grid-2">
     <div class="card" id="import"><h3>Carica voti giornata</h3>
       <label class="drop">${ICON.up.replace('<svg', '<svg style="width:28px;height:28px;margin:0 auto 8px;stroke:var(--accent)"')}
-        <b>Scegli i file dei voti</b><div class="small muted">Excel scaricati da fantacalcio.it (Voti_Fantacalcio_…_Giornata_N.xlsx). Puoi sceglierne anche più di uno insieme.</div>
-        <input type="file" id="fileVoti" accept=".xlsx,.xls" multiple></label>
+        <b>Scegli i file dei voti</b><div class="small muted">Excel o CSV scaricati da fantacalcio.it (Voti_Fantacalcio_…_Giornata_N). Puoi sceglierne anche più di uno insieme.</div>
+        <input type="file" id="fileVoti" accept=".xlsx,.xls,.csv,text/csv" multiple></label>
       <div class="field" style="margin-top:12px"><label for="votoFoglio">Voto da usare</label>
         <select class="input" id="votoFoglio">${['Fantacalcio', 'Statistico', 'Italia'].map(x => `<option ${x === (c.votoFoglio || 'Fantacalcio') ? 'selected' : ''}>${x}</option>`).join('')}</select></div>
       ${d ? `<div class="tag-line">${d.gA.map(g => `<span class="chip ok">${g}ª ✓ <button class="x" style="width:18px;height:18px;font-size:12px;background:none" data-del-voti="${g}" aria-label="Elimina voti giornata ${g}">×</button></span>`).join('') || '<span class="small muted">Nessuna giornata caricata.</span>'}</div>` : ''}
@@ -860,12 +901,14 @@ function playerForm(id) {
 async function parseFile(file) {
   const d = D();
   const wb = XLSX.read(await file.arrayBuffer(), { type: 'array' });
-  const foglio = S.config?.votoFoglio || 'Fantacalcio';
-  const ws = wb.Sheets[foglio] || wb.Sheets[wb.SheetNames[0]];
+  const voluto = S.config?.votoFoglio || 'Fantacalcio';
+  const foglio = wb.Sheets[voluto] ? voluto : wb.SheetNames[0];
+  const ws = wb.Sheets[foglio];
   const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
-  const titolo = String(rows[0]?.[0] || '') + ' ' + file.name;
-  const m = titolo.match(/(\d+)\s*[ªa°º]?\s*giornata/i) || file.name.match(/Giornata[_\s-]*(\d+)/i);
-  const giornata = m ? Number(m[1]) : null;
+  // numero di giornata: prima dal nome del file (…_Giornata_9), poi dal titolo dentro il file
+  const titolo = String(rows[0]?.[0] || '');
+  const m = file.name.match(/Giornata[_\s-]*(\d+)/i) || titolo.match(/giornata\s*(\d+)/i) || titolo.match(/(\d+)\s*[ªa°º]\s*giornata/i);
+  const giornata = m && Number(m[1]) >= 1 && Number(m[1]) <= 38 ? Number(m[1]) : null;
   let squadra = '', head = null; const righe = [];
   rows.forEach(r => {
     if (r[0] === 'Cod.') { head = r.map(String); return; }
@@ -897,7 +940,16 @@ async function parseFile(file) {
   });
   trovati.forEach(t => t.row.FV = fv(t.row));
   const assenti = d.rosa.filter(p => !trovati.some(t => t.p.Id === p.Id));
-  return { file, foglio, giornata, letti: righe.length, trovati, updates, assenti };
+  return { file, foglio: foglio === voluto ? voluto : '', giornata, letti: righe.length, trovati, updates, assenti };
+}
+
+// Numeri veloci di un file voti (per il riepilogo prima di salvare)
+function riepilogo(x) {
+  const t = x.trovati, conV = t.filter(y => y.row.FV != null);
+  const n = k => sum(t.map(y => Number(y.row[k]) || 0));
+  const top = conV.slice().sort((a, b) => b.row.FV - a.row.FV)[0];
+  return { referto: t.length, sv: t.length - conV.length, fuori: x.assenti.length, media: avg(conV.map(y => y.row.FV)),
+    gol: n('Gf') + n('Rf'), ass: n('Ass'), amm: n('Amm'), esp: n('Esp'), top };
 }
 
 async function importFiles(files) {
@@ -917,23 +969,33 @@ async function importFiles(files) {
   anteprimaMultipla(lista);
 }
 
-function anteprimaSingola({ file, foglio, giornata, trovati, updates, assenti }) {
+// Un file: solo un riepilogo veloce e il pulsante Conferma subito in vista
+function anteprimaSingola(x) {
+  const { file, foglio, giornata, trovati, updates } = x;
+  const r = riepilogo(x);
   const gia = D().gA.includes(giornata);
-  openSheet(`<div class="panel-head"><div><div class="small muted">${esc(file.name)} · voto ${esc(foglio)}</div><h2>Voti ${giornata ? giornata + 'ª giornata' : ''}</h2></div><button class="x" data-close aria-label="Chiudi">×</button></div>
-    <div class="field"><label for="impG">Giornata di Serie A</label><input class="input" id="impG" type="number" min="1" max="38" value="${giornata || ''}"></div>
-    ${gia ? '<div class="note" style="margin-bottom:12px">Questa giornata è già caricata: i voti verranno sostituiti.</div>' : ''}
-    <div class="card"><div class="card-head"><h3>I tuoi giocatori a referto</h3><span class="chip ok">${trovati.length}</span></div>
-      <div class="list">${trovati.sort((a, b) => (b.row.FV ?? -1) - (a.row.FV ?? -1)).map(t => `<div class="li">${roleBadges(t.p)}<div class="grow"><div class="name">${esc(t.p.Nome)}</div><div class="sub">${esc(t.r.Squadra)} · ${bonusTxt(t.row)}</div></div>
-        <div class="right"><span class="heat" style="${heat(t.row.FV)}">${t.row.FV == null ? 'sv' : fmt(t.row.FV, 1)}</span><div class="sub">voto ${esc(t.r.Voto)}</div></div></div>`).join('')}</div></div>
-    ${assenti.length ? `<div class="note" style="margin-top:12px"><b>Non a referto:</b> ${assenti.map(p => esc(p.Nome)).join(', ')}</div>` : ''}
-    <button class="btn primary block" id="impSave" style="margin-top:14px">${ICON.save} Salva voti nel foglio</button>`,
+  const conferma = `${ICON.check} Conferma e salva`;
+  openSheet(`<div class="panel-head"><div style="min-width:0"><div class="small muted imp-file">${esc(file.name)}${foglio ? ' · voto ' + esc(foglio) : ''}</div><h2>${giornata ? `Voti ${giornata}ª giornata` : 'Voti della giornata'}</h2></div><button class="x" data-close aria-label="Chiudi">×</button></div>
+    <div class="imp-sum">
+      <div><b class="num">${r.referto}</b><span>a referto</span></div>
+      <div><b class="num">${r.fuori}</b><span>non a referto</span></div>
+      <div><b class="num">${fmt(r.media, 1)}</b><span>media FV</span></div>
+    </div>
+    <div class="imp-line">⚽ <b>${r.gol}</b> gol · 🅰️ <b>${r.ass}</b> assist · 🟨 <b>${r.amm}</b> · 🟥 <b>${r.esp}</b>${r.sv ? ` · ${r.sv} s.v.` : ''}${r.top ? `<br>★ Migliore: <b>${esc(r.top.p.Nome)}</b> ${fmt(r.top.row.FV, 1)}` : ''}</div>
+    ${gia ? '<div class="note warn-note">Questa giornata è già caricata: confermando sostituisco i voti.</div>' : ''}
+    <div class="imp-actions">
+      <label class="imp-g"><span>Giornata</span><input class="input" id="impG" type="number" min="1" max="38" inputmode="numeric" value="${giornata || ''}"></label>
+      <button class="btn primary" id="impSave">${conferma}</button>
+    </div>`,
   panel => {
+    const gIn = panel.querySelector('#impG');
+    if (!giornata) gIn.focus();
     panel.querySelector('#impSave').onclick = async () => {
-      const g = Number(panel.querySelector('#impG').value);
-      if (!g) { toast('Indica la giornata'); return; }
+      const g = Number(gIn.value);
+      if (!g) { toast('Indica la giornata'); gIn.focus(); return; }
       const btn = panel.querySelector('#impSave'); btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Salvo…';
       const ok = await write('importVoti', { giornata: g, rows: trovati.map(t => t.row), rosaUpdates: updates }, `Voti della ${g}ª giornata salvati`);
-      if (ok) closeSheet(); else { btn.disabled = false; btn.textContent = 'Salva voti nel foglio'; }
+      if (ok) closeSheet(); else { btn.disabled = false; btn.innerHTML = conferma; }
     };
   });
 }
@@ -944,15 +1006,17 @@ function anteprimaMultipla(lista) {
   lista.sort((a, b) => (a.giornata ?? 99) - (b.giornata ?? 99));
   const righe = lista.map((x, i) => {
     if (x.errore || !x.letti) return `<div class="li"><div class="grow"><div class="name">${esc(x.file.name)}</div><div class="sub" style="color:var(--loss)">${x.errore || 'nessun voto trovato'} · verrà saltato</div></div></div>`;
-    return `<div class="li" data-i="${i}"><div class="grow"><div class="name">${esc(x.file.name)}</div>
-      <div class="sub">${x.trovati.length} tuoi giocatori a referto${gA.includes(x.giornata) ? ' · <b>già caricata, verrà sostituita</b>' : ''}</div><div class="sub st"></div></div>
-      <div class="right" style="width:84px"><input class="input g-in" type="number" min="1" max="38" value="${x.giornata || ''}" aria-label="Giornata" style="text-align:center"></div></div>`;
+    const r = riepilogo(x);
+    return `<div class="li" data-i="${i}"><input class="input g-in" type="number" min="1" max="38" inputmode="numeric" value="${x.giornata || ''}" placeholder="?" aria-label="Giornata">
+      <div class="grow">${x.giornata ? '' : `<div class="sub imp-file" style="color:var(--draw)">Scrivi la giornata · ${esc(x.file.name)}</div>`}<div class="sub">${r.referto} a referto · ⚽ ${r.gol} · media ${fmt(r.media, 1)}</div>
+      ${gA.includes(x.giornata) ? '<div class="sub" style="color:var(--draw)">già caricata: verrà sostituita</div>' : ''}<div class="sub st"></div></div></div>`;
   }).join('');
   const validi = lista.filter(x => !x.errore && x.letti);
-  openSheet(`<div class="panel-head"><div><div class="small muted">${lista.length} file · voto ${esc(validi[0]?.foglio || '')}</div><h2>Carica più giornate</h2></div><button class="x" data-close aria-label="Chiudi">×</button></div>
-    <div class="note" style="margin-bottom:12px">Controlla il numero di giornata a destra di ogni file, poi salva: le carico una dopo l'altra.</div>
-    <div class="card"><div class="list">${righe}</div></div>
-    <button class="btn primary block" id="impAll" style="margin-top:14px" ${validi.length ? '' : 'disabled'}>${ICON.save} Salva ${validi.length} giornate nel foglio</button>`,
+  const fogli = [...new Set(validi.map(x => x.foglio).filter(Boolean))];
+  openSheet(`<div class="panel-head"><div><div class="small muted">${lista.length} file${fogli.length === 1 ? ' · voto ' + esc(fogli[0]) : ''}</div><h2>Carica ${validi.length} giornate</h2></div><button class="x" data-close aria-label="Chiudi">×</button></div>
+    <div class="small muted" style="margin-bottom:6px">Il numero a sinistra è la giornata: correggilo se serve.</div>
+    <div class="list imp-multi">${righe}</div>
+    <div class="imp-actions sticky"><button class="btn primary block" id="impAll" ${validi.length ? '' : 'disabled'}>${ICON.check} Conferma e salva ${validi.length} giornate</button></div>`,
   panel => {
     panel.querySelector('#impAll').onclick = async () => {
       const job = [];
@@ -994,6 +1058,7 @@ function bind(root) {
   root.querySelectorAll('[data-giornata]').forEach(b => b.onclick = () => giornataDettaglio(b.dataset.giornata));
   root.querySelectorAll('[data-stat]').forEach(b => b.onclick = () => { ui.statTab = b.dataset.stat; render(); });
   root.querySelectorAll('[data-rep]').forEach(b => b.onclick = () => { ui.rep = b.dataset.rep; render(); });
+  root.querySelectorAll('[data-ruolo]').forEach(b => b.onclick = () => { ui.ruolo = b.dataset.ruolo; render(); });
   root.querySelectorAll('[data-sort]').forEach(b => b.onclick = () => { const k = b.dataset.sort; ui.sortDir = ui.sortKey === k ? -ui.sortDir : -1; ui.sortKey = k; render(); });
   root.querySelectorAll('[data-modulo]').forEach(b => b.onclick = () => { ui.editForm = { modulo: b.dataset.modulo, slot: bestXI(b.dataset.modulo).slot }; ui.formSel = null; if (view !== 'formazione') go('formazione'); else render(); toast('Undici consigliato in ' + b.dataset.modulo); });
   root.querySelectorAll('[data-theme]').forEach(b => b.onclick = () => { ui.theme = b.dataset.theme; LS.set('fc_theme', ui.theme); applyTheme(); render(); });
