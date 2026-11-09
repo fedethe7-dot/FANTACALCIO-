@@ -1,7 +1,7 @@
 'use strict';
 /* Fanta 26/27 – app personale per la rosa Mantra. Dati nel foglio Google via Apps Script. */
 
-const VERSION = '1.4.0';
+const VERSION = '1.4.1';
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -450,7 +450,7 @@ function vSquadra() {
   <div class="quick section">
     <button class="qa primary" data-act="nuova-giornata"><span class="qi">${ICON.plus}</span><b>Registra</b><small>nuova partita</small></button>
     <button class="qa" data-go="formazione"><span class="qi">${ICON.wand}</span><b>Chi schiero?</b><small>${modTop ? 'di solito ' + esc(modTop.m) : 'undici consigliato'}</small></button>
-    <button class="qa" data-go="altro" data-scroll="import"><span class="qi">${ICON.up}</span><b>Carica voti</b><small>${d.ultimaA ? 'ultima: ' + d.ultimaA + 'ª' : 'file fantacalcio.it'}</small></button>
+    <button class="qa" data-act="carica-voti"><span class="qi">${ICON.up}</span><b>Carica voti</b><small>${d.ultimaA ? 'ultima: ' + d.ultimaA + 'ª' : 'file fantacalcio.it'}</small></button>
   </div>
 
   ${last ? `<div class="section"><h3>Ultima partita</h3>${spotlight(last)}</div>` : ''}
@@ -1032,7 +1032,9 @@ function playerForm(id) {
 // Legge un file voti e lo abbina alla rosa. Non salva niente.
 async function parseFile(file) {
   const d = D();
-  const wb = XLSX.read(await file.arrayBuffer(), { type: 'array' });
+  // CSV: lo leggo come testo "grezzo", altrimenti un voto scritto all'italiana ("6,5") diventerebbe 65
+  const csv = /\.csv$/i.test(file.name) || /csv|text\/plain/i.test(file.type);
+  const wb = csv ? XLSX.read(await file.text(), { type: 'string', raw: true }) : XLSX.read(await file.arrayBuffer(), { type: 'array' });
   const voluto = S.config?.votoFoglio || 'Fantacalcio';
   const foglio = wb.Sheets[voluto] ? voluto : wb.SheetNames[0];
   const ws = wb.Sheets[foglio];
@@ -1099,6 +1101,12 @@ async function importFiles(files) {
     try { lista.push(await parseFile(f)); }
     catch (e) { lista.push({ file: f, errore: 'file non leggibile' }); }
   }
+  // Caso normale: ogni file ha la sua giornata nel nome, nessuna è già caricata e nessuna è doppia
+  // → salvo subito, senza schermate di conferma
+  const gA = D().gA, giornate = lista.map(x => x.giornata);
+  const tuttoChiaro = lista.every(x => !x.errore && x.letti && x.trovati.length && x.giornata && !gA.includes(x.giornata))
+    && new Set(giornate).size === giornate.length;
+  if (tuttoChiaro) return salvaSubito(lista);
   if (lista.length === 1) {
     const x = lista[0];
     if (x.errore) { toast('File non leggibile'); return; }
@@ -1106,6 +1114,35 @@ async function importFiles(files) {
     return anteprimaSingola(x);
   }
   anteprimaMultipla(lista);
+}
+
+// Salvataggio diretto (dalla giornata più vecchia alla più recente) con un riepilogo finale
+async function salvaSubito(lista) {
+  lista.sort((a, b) => a.giornata - b.giornata);
+  wseq++;
+  syncState.busy = true; renderSync();
+  let fatte = 0, ultimo = null, errore = '';
+  for (const x of lista) {
+    toast(lista.length > 1 ? `Salvo la ${x.giornata}ª giornata (${fatte + 1} di ${lista.length})…` : `Salvo i voti della ${x.giornata}ª…`);
+    try { ultimo = await apiPost('importVoti', { giornata: x.giornata, rows: x.trovati.map(t => t.row), rosaUpdates: x.updates }); fatte++; }
+    catch (e) { errore = e.message; break; }
+  }
+  if (ultimo) { setData(ultimo); syncState.error = null; }
+  syncState.busy = false; renderSync(); render();
+  const nomi = lista.slice(0, fatte).map(x => x.giornata + 'ª').join(', ');
+  if (errore) toast(`${fatte ? 'Salvate: ' + nomi + '. ' : ''}Errore: ${errore}`);
+  else {
+    const r = riepilogo(lista[lista.length - 1]);
+    toast(lista.length > 1 ? `Voti salvati ✓ giornate ${nomi}` : `Voti ${nomi} salvati ✓ ${r.referto} a referto · media ${fmt(r.media, 1)}`);
+  }
+}
+
+// Scelta dei file da qualsiasi punto dell'app (es. pulsante "Carica voti" in Home)
+function scegliFileVoti() {
+  const inp = document.createElement('input');
+  inp.type = 'file'; inp.multiple = true; inp.accept = '.xlsx,.xls,.csv,text/csv';
+  inp.onchange = () => { const fs = [...inp.files]; if (fs.length) importFiles(fs).catch(err => toast('File non leggibile: ' + err.message)); };
+  inp.click();
 }
 
 // Un file: solo un riepilogo veloce e il pulsante Conferma subito in vista
@@ -1235,6 +1272,7 @@ function bind(root) {
 
   const acts = {
     'nuova-giornata': () => giornataForm(null),
+    'carica-voti': scegliFileVoti,
     'consiglia': () => { const F = currentForm(); ui.editForm = { modulo: F.modulo, slot: bestXI(F.modulo).slot }; ui.formSel = null; render(); toast('Undici consigliato in ' + F.modulo); },
     'salva-form': () => write('saveConfig', { formazione: currentForm() }, 'Formazione salvata'),
     'sync': () => sync(false),
