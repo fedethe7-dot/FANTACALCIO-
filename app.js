@@ -1,7 +1,7 @@
 'use strict';
 /* Fanta 26/27 – app personale per la rosa Mantra. Dati nel foglio Google via Apps Script. */
 
-const VERSION = '1.3.0';
+const VERSION = '1.4.0';
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -43,7 +43,12 @@ const ruoliDi = p => String(p?.Ruoli || '').toUpperCase().split(/[,/\s]+/).filte
 const compat = (p, r) => !!p && ruoliDi(p).some(x => r.includes(x));
 const roleBadges = p => `<span class="roles">${ruoliDi(p).map(r => `<span class="role ${RUOLI[r]?.c || ''}">${RUOLI[r]?.l || r}</span>`).join('')}</span>`;
 const REPARTI = { P: 'Portieri', D: 'Difensori', C: 'Centrocampisti', A: 'Attaccanti' };
-const DEFAULT_BONUS = { gol: 3, rigore: 3, rigoreSbagliato: -3, rigoreParato: 3, golSubito: -1, autogol: -2, amm: -0.5, esp: -1, assist: 1 };
+// Bonus/malus. Il gol può valere diverso per reparto (Mantra); imbattuto e fuori ruolo partono da 0 = come prima.
+const DEFAULT_BONUS = { golP: 3, golD: 3, golC: 3, golA: 3, rigore: 3, rigoreSbagliato: -3, rigoreParato: 3, golSubito: -1, autogol: -2, amm: -0.5, esp: -1, assist: 1, imbattuto: 0, fuoriRuolo: 0 };
+const BONUS_NOMI = { golP: 'Gol portiere', golD: 'Gol difensore', golC: 'Gol centrocampista', golA: 'Gol attaccante', rigore: 'Rigore segnato', rigoreSbagliato: 'Rigore sbagliato', rigoreParato: 'Rigore parato', golSubito: 'Gol subito', autogol: 'Autogol', amm: 'Ammonizione', esp: 'Espulsione', assist: 'Assist', imbattuto: 'Portiere imbattuto', fuoriRuolo: 'Malus fuori ruolo' };
+const attivo = p => !!p && p.Attivo !== false && p.Attivo !== 'FALSE' && p.Attivo !== 'false';
+const numOrNull = x => (x === '' || x == null || isNaN(Number(x))) ? null : Number(x);
+const fmtPt = n => fmt(n, n % 1 ? 1 : 0);
 
 /* ───────── Stato ───────── */
 let S = LS.get('fc_data', null);
@@ -74,47 +79,87 @@ function setData(d) {
   syncState.last = new Date().toISOString(); LS.set('fc_last', syncState.last);
   _D = null;
 }
+// Ogni scrittura alza questo contatore: una lettura partita prima di una scrittura non sovrascrive i dati nuovi
+let wseq = 0;
 async function sync(silent) {
   if (!API.url || !API.key) return;
+  const mio = wseq;
   syncState.busy = true; syncState.error = null; renderSync();
-  try { setData(await apiGet()); if (!silent) toast('Dati aggiornati'); }
-  catch (e) { syncState.error = e.message; if (!silent) toast('Sincronizzazione non riuscita: ' + e.message); }
-  syncState.busy = false; renderSync(); render();
+  try {
+    const d = await apiGet();
+    if (mio === wseq) { setData(d); if (!silent) toast('Dati aggiornati'); }
+  } catch (e) { syncState.error = e.message; if (!silent) toast('Sincronizzazione non riuscita: ' + e.message); }
+  syncState.busy = false; renderSync();
+  // non ridisegno mentre si sta scrivendo in un campo (es. il menu modulo): perderebbe il focus
+  if (!$('#main').contains(document.activeElement) || document.activeElement === $('#main')) render();
 }
 async function write(action, payload, okMsg) {
   if (!API.url) { toast('Collega prima il foglio (Altro → Collegamento)'); return false; }
+  wseq++;
   syncState.busy = true; renderSync();
-  try { setData(await apiPost(action, payload)); toast(okMsg || 'Salvato'); return true; }
+  try { setData(await apiPost(action, payload)); syncState.error = null; toast(okMsg || 'Salvato'); return true; }
   catch (e) { toast('Errore: ' + e.message); return false; }
   finally { syncState.busy = false; renderSync(); render(); }
 }
+// La rosa si salva tutta insieme: prima riscarico quella aggiornata dal foglio (magari cambiata da un altro
+// dispositivo) e applico solo la mia modifica, così non cancello quello che hai fatto altrove.
+async function salvaRosa(modifica, okMsg) {
+  if (!API.url) { toast('Collega prima il foglio (Altro → Collegamento)'); return false; }
+  wseq++;
+  syncState.busy = true; renderSync();
+  try { setData(await apiGet()); }
+  catch (e) { syncState.busy = false; renderSync(); toast('Non riesco a leggere il foglio: ' + e.message); return false; }
+  return write('saveRosa', modifica(S.rosa || []), okMsg);
+}
 
 /* ───────── Calcoli ───────── */
-const bonus = () => Object.assign({}, DEFAULT_BONUS, S?.config?.bonus || {});
-function fv(v, b = bonus()) {
+function bonus() {
+  const salvati = S?.config?.bonus || {};
+  const b = Object.assign({}, DEFAULT_BONUS, salvati);
+  // vecchie impostazioni: un solo valore "gol" per tutti
+  if (salvati.gol != null) ['golP', 'golD', 'golC', 'golA'].forEach(k => { if (salvati[k] == null) b[k] = Number(salvati.gol); });
+  return b;
+}
+// Fantavoto. rep = reparto del giocatore (P/D/C/A): serve per il bonus gol e il portiere imbattuto.
+function fv(v, b = bonus(), rep = 'C') {
   if (isSV(v)) return null;
   const n = k => Number(v[k]) || 0;
-  return Number(v.Voto) + b.gol * n('Gf') + b.rigore * n('Rf') + b.rigoreSbagliato * n('Rs') + b.rigoreParato * n('Rp')
-    + b.golSubito * n('Gs') + b.autogol * n('Au') + b.amm * n('Amm') + b.esp * n('Esp') + b.assist * n('Ass');
+  const golB = b['gol' + rep] ?? b.golC;
+  const imb = rep === 'P' && n('Gs') === 0 ? b.imbattuto : 0;
+  return Number(v.Voto) + golB * n('Gf') + b.rigore * n('Rf') + b.rigoreSbagliato * n('Rs') + b.rigoreParato * n('Rp')
+    + b.golSubito * n('Gs') + b.autogol * n('Au') + b.amm * n('Amm') + b.esp * n('Esp') + b.assist * n('Ass') + imb;
 }
-const isSV = v => v.SV === true || v.SV === 'TRUE' || String(v.Voto).includes('*') || v.Voto === '' || v.Voto == null;
+const isSV = v => v.SV === true || v.SV === 'TRUE' || v.SV === 'true' || String(v.Voto).includes('*') || v.Voto === '' || v.Voto == null || isNaN(Number(v.Voto));
 const esitoK = e => { const c = String(e || '').trim()[0]?.toUpperCase(); return ['V', 'P', 'S'].includes(c) ? c : ''; };
+// Gol fantacalcio dai punti: sotto la soglia 0 gol, poi uno ogni "fascia" punti (di solito 66 e 6)
+function golFanta(pt) {
+  const c = S?.config || {}; const soglia = Number(c.soglia) || 66, fascia = Number(c.fascia) || 6;
+  return pt == null ? null : pt < soglia ? 0 : Math.floor((pt - soglia) / fascia) + 1;
+}
+function esitoAuto(pt, pa) {
+  if (pt == null || pa == null) return '';
+  const a = golFanta(pt), b = golFanta(pa);
+  return a > b ? 'V' : a < b ? 'S' : 'P';
+}
 const parseForm = f => { if (!f) return null; if (typeof f === 'object') return f; try { return JSON.parse(f); } catch (e) { return null; } };
 
 function D() {
   if (_D && _Dkey === S) return _D;
   const b = bonus();
-  const rosa = (S?.rosa || []).filter(p => p.Id && p.Attivo !== false && p.Attivo !== 'FALSE');
-  const tutti = S?.rosa || [];
+  const rosa = (S?.rosa || []).filter(p => p.Id && attivo(p));
+  const tutti = (S?.rosa || []).filter(p => p.Id);
   const byId = Object.fromEntries(tutti.map(p => [p.Id, p]));
-  const gA = [...new Set((S?.voti || []).map(v => Number(v.Giornata)))].sort((a, b) => a - b);
+  const gA = [...new Set((S?.voti || []).map(v => Number(v.Giornata)).filter(Boolean))].sort((a, b) => a - b);
   const ultimaA = gA[gA.length - 1];
   const votiP = {};
-  (S?.voti || []).forEach(v => { (votiP[v.Id] ||= []).push({ ...v, G: Number(v.Giornata), FV: fv(v, b) }); });
+  (S?.voti || []).forEach(v => { (votiP[v.Id] ||= []).push({ ...v, G: Number(v.Giornata), FV: fv(v, b, byId[v.Id]?.Reparto) }); });
   Object.values(votiP).forEach(a => a.sort((x, y) => x.G - y.G));
 
-  const giornate = (S?.giornate || []).map(g => ({ ...g, n: Number(g.Giornata), A: g.GiornataA === '' ? null : Number(g.GiornataA), e: esitoK(g.Esito), F: parseForm(g.Formazione), pt: g.Punteggio === '' ? null : Number(g.Punteggio) }))
-    .filter(g => g.n).sort((a, b) => a.n - b.n);
+  const giornate = (S?.giornate || []).map(g => {
+    const pt = numOrNull(g.Punteggio), pa = numOrNull(g.PuntiAvv);
+    const eMan = esitoK(g.Esito);
+    return { ...g, n: Number(g.Giornata), A: numOrNull(g.GiornataA), pt, pa, e: eMan || esitoAuto(pt, pa), eAuto: !eMan && !!esitoAuto(pt, pa), F: parseForm(g.Formazione) };
+  }).filter(g => g.n).sort((a, b) => a.n - b.n);
 
   // statistiche giocatori
   const st = {};
@@ -150,9 +195,16 @@ function D() {
     }
   });
   const conForm = giornate.filter(g => g.F?.slot).length;
+  const ultime3 = gA.slice(-3);
+  const IND = S?.config?.indisponibili || {};
   Object.values(st).forEach(s => {
     s.titPct = conForm ? s.tit / conForm : null;
-    s.score = s.pres ? 0.45 * s.fm + 0.55 * (s.forma ?? s.fm) - (s.saltataUltima ? 0.8 : 0) : (s.saltataUltima ? 4.2 : 5);
+    // assenze nelle ultime 3 giornate caricate (non a referto o senza voto): pesano sul fantavoto previsto
+    const vs = votiP[s.id] || [];
+    s.assenze3 = ultime3.filter(g => !vs.some(v => v.G === g && v.FV != null)).length;
+    s.stato = statoGiocatore(s, vs, ultimaA, IND[s.id]);
+    s.score = s.pres ? 0.45 * s.fm + 0.55 * (s.forma ?? s.fm) - 0.4 * s.assenze3 : 4.5;
+    if (s.stato.m === 'dub') s.score -= 0.5;
   });
 
   // squadra
@@ -171,6 +223,24 @@ function D() {
   _Dkey = S;
   return _D;
 }
+
+/* Disponibilità: segnata a mano (config.indisponibili) o dedotta dai voti dell'ultima giornata */
+const STATI = { ok: 'Disponibile', dub: 'In dubbio', inf: 'Infortunato', squ: 'Squalificato' };
+const STATO_ICO = { dub: '❓', inf: '🚑', squ: '🟥', diff: '⚠️' };
+// Serie A: squalifica alla 5ª, 10ª, 14ª, 17ª ammonizione e poi a ogni ammonizione dalla 19ª
+const SQUALIFICA_AMM = n => [5, 10, 14, 17].includes(n) || n >= 19;
+const DIFFIDA_AMM = n => [4, 9, 13, 16, 18].includes(n);
+function statoGiocatore(s, vs, ultimaA, man) {
+  let auto = null;
+  const vu = ultimaA != null ? vs.find(v => v.G === ultimaA) : null;
+  if (vu && Number(vu.Esp) > 0) auto = { m: 'squ', testo: `Espulso nella ${ultimaA}ª: probabile squalifica` };
+  else if (vu && Number(vu.Amm) > 0 && SQUALIFICA_AMM(s.amm)) auto = { m: 'squ', testo: `${s.amm}ª ammonizione nella ${ultimaA}ª: probabile squalifica` };
+  else if (DIFFIDA_AMM(s.amm)) auto = { m: 'diff', testo: `Diffidato (${s.amm} gialli)` };
+  if (man?.m && man.m !== 'ok') return { m: man.m, testo: STATI[man.m] + (man.nota ? ': ' + man.nota : ''), man: true, escluso: man.m === 'inf' || man.m === 'squ', auto };
+  if (auto && auto.m === 'squ' && man?.m !== 'ok') return { ...auto, escluso: true, auto };
+  return auto?.m === 'diff' ? { ...auto, escluso: false, auto } : { m: '', testo: '', escluso: false, auto: man?.m === 'ok' ? auto : null };
+}
+const statoBadge = s => s?.m && STATO_ICO[s.m] ? `<span class="stato ${s.m}" title="${esc(s.testo)}">${STATO_ICO[s.m]}</span>` : '';
 
 /* Formazione migliore: assegnazione ottimale (algoritmo ungherese) */
 function hungarian(a) {
@@ -196,14 +266,17 @@ function hungarian(a) {
   return ans;
 }
 function bestXI(modulo) {
-  const { rosa, st } = D();
+  const { st } = D();
+  const rosa = D().rosa.filter(p => !st[p.Id].stato.escluso); // infortunati e squalificati restano fuori
   const slots = slotsDi(modulo);
-  if (rosa.length < slots.length) return { slot: slots.map(() => ''), tot: 0 };
-  const cost = slots.map(r => rosa.map(p => compat(p, r) ? 20 - st[p.Id].score : 1000));
+  if (!rosa.length) return { slot: slots.map(() => ''), tot: 0, buchi: slots.length, media: null };
+  // se i disponibili sono meno degli 11 posti aggiungo "posti vuoti" finti, così schiero comunque chi c'è
+  const vuoti = Math.max(0, slots.length - rosa.length);
+  const cost = slots.map(r => [...rosa.map(p => compat(p, r) ? 20 - st[p.Id].score : 1000), ...Array(vuoti).fill(1000)]);
   const ass = hungarian(cost);
   let tot = 0, buchi = 0;
   const slot = ass.map((j, i) => {
-    if (j < 0 || cost[i][j] >= 1000) { buchi++; return ''; }
+    if (j < 0 || j >= rosa.length || cost[i][j] >= 1000) { buchi++; return ''; }
     tot += st[rosa[j].Id].score; return rosa[j].Id;
   });
   return { slot, tot, buchi, media: tot / Math.max(1, slots.length - buchi) };
@@ -297,12 +370,12 @@ async function cercaFoto(p) {
   }
   return '';
 }
-const fotoCoda = new Set(); let fotoAttivi = 0;
+const fotoCoda = new Set(), fotoInCorso = new Set(); let fotoAttivi = 0;
 function caricaFoto() {
   if (!S) return;
   const now = Date.now();
   (S.rosa || []).forEach(p => {
-    if (!p.Id || p.Foto) return;
+    if (!p.Id || p.Foto || fotoInCorso.has(p.Id)) return;
     const c = FOTO[p.Id];
     if (c && c.n === p.Nome && (c.u || now - c.t < 7 * 864e5)) return;
     fotoCoda.add(p.Id);
@@ -311,10 +384,10 @@ function caricaFoto() {
 }
 function pompaFoto() {
   while (fotoAttivi < 3 && fotoCoda.size) {
-    const id = fotoCoda.values().next().value; fotoCoda.delete(id); fotoAttivi++;
+    const id = fotoCoda.values().next().value; fotoCoda.delete(id); fotoAttivi++; fotoInCorso.add(id);
     const p = D().byId[id];
     cercaFoto(p).then(u => { FOTO[id] = { u, t: Date.now(), n: p?.Nome }; LS.set('fc_foto', FOTO); if (u) mostraFoto(id, u); })
-      .catch(() => {}).finally(() => { fotoAttivi--; pompaFoto(); });
+      .catch(() => {}).finally(() => { fotoAttivi--; fotoInCorso.delete(id); pompaFoto(); });
   }
 }
 function mostraFoto(id, u) {
@@ -328,8 +401,7 @@ async function cambiaFoto(id) {
   if (link && !/^https:\/\//.test(link)) { toast('Il link deve iniziare con https://'); return; }
   if (link) FOTO[id] = { u: link, t: Date.now(), n: p.Nome, man: true }; else delete FOTO[id];
   LS.set('fc_foto', FOTO);
-  const lista = S.rosa.map(x => x.Id === id ? { ...x, Foto: link } : x);
-  if (await write('saveRosa', lista, link ? 'Foto aggiornata' : 'Torno alla foto automatica')) { closeSheet(); playerSheet(id); }
+  if (await salvaRosa(r => r.map(x => x.Id === id ? { ...x, Foto: link } : x), link ? 'Foto aggiornata' : 'Torno alla foto automatica')) { closeSheet(); playerSheet(id); }
   else render();
 }
 
@@ -344,7 +416,7 @@ function vSquadra() {
   const NOMI = { V: ['vittoria', 'vittorie'], P: ['pareggio', 'pareggi'], S: ['sconfitta', 'sconfitte'] };
   let streak = '';
   if (conE.length) { const e0 = conE[conE.length - 1].e; let k = 0; for (let i = conE.length - 1; i >= 0 && conE[i].e === e0; i--) k++; streak = k > 1 ? `${k} ${NOMI[e0][1]} di fila` : `Ultima: ${NOMI[e0][0]}`; }
-  const top = (k, min = 0, f = s => s[k]) => Object.values(d.st).filter(s => d.byId[s.id] && d.byId[s.id].Attivo !== false && s.pres >= min && f(s) != null && f(s) > 0).sort((a, b) => f(b) - f(a))[0];
+  const top = (k, min = 0, f = s => s[k]) => Object.values(d.st).filter(s => attivo(d.byId[s.id]) && s.pres >= min && f(s) != null && f(s) > 0).sort((a, b) => f(b) - f(a))[0];
   const star = (label, icon, s, val, sub) => { const p = s && d.byId[s.id];
     return `<button class="star" data-player="${p ? p.Id : ''}">${avatar(p, 'xl')}<span class="star-tag">${icon} ${label}</span>
       <b>${p ? esc(shortName(p.Nome)) : '–'}</b><small>${p ? val(s) : sub || 'Nessun dato'}</small></button>`; };
@@ -422,7 +494,7 @@ function spotlight(g) {
       ${g.e ? resBadge(g.e, 'lg') : '<span class="res lg" style="background:var(--surface-2);color:var(--ink-3)">?</span>'}
       <div style="flex:1;min-width:0"><div class="small muted">Partita ${g.n}${g.A ? ` · ${g.A}ª Serie A` : ''}${g.F?.modulo || g.Modulo ? ` · ${esc(g.F?.modulo || g.Modulo)}` : ''}</div>
         <div class="spot-title">${g.Avversario ? 'vs ' + esc(g.Avversario) : ({ V: 'Vittoria', P: 'Pareggio', S: 'Sconfitta' }[g.e] || 'Partita')}</div></div>
-      <div class="spot-score"><b>${g.pt != null ? fmt(g.pt, g.pt % 1 ? 1 : 0) : '–'}</b>${g.PuntiAvv !== '' && g.PuntiAvv != null ? `<span>${fmt(Number(g.PuntiAvv), Number(g.PuntiAvv) % 1 ? 1 : 0)} avv.</span>` : ''}</div>
+      <div class="spot-score"><b>${g.pt != null ? fmtPt(g.pt) : '–'}</b>${g.pa != null ? `<span>${fmtPt(g.pa)} avv.</span>` : ''}${risultato(g)}</div>
     </button>
     ${g.Migliore || g.Peggiore ? `<div class="sp-row">${pl(g.Migliore, '★ Migliore', 'best')}${pl(g.Peggiore, '▼ Peggiore', 'worst')}</div>` : ''}
     ${g.Marcatori ? `<div class="tag-line" style="margin-top:12px">${g.Marcatori.split(',').map(x => x.trim()).filter(Boolean).map(x => `<span class="chip">⚽ ${esc(x)}</span>`).join('')}</div>` : ''}
@@ -454,6 +526,8 @@ function chartPunteggi(gs) {
   </svg>`;
 }
 
+const risultato = g => g.pt != null && g.pa != null ? `<div class="vs num">${golFanta(g.pt)}-${golFanta(g.pa)}</div>` : '';
+
 function giornataCard(g) {
   const d = D();
   const nm = id => d.byId[id] ? esc(d.byId[id].Nome) : esc(id || '–');
@@ -464,7 +538,7 @@ function giornataCard(g) {
       <div style="font-weight:700">${g.Avversario ? 'vs ' + esc(g.Avversario) : ({ V: 'Vittoria', P: 'Pareggio', S: 'Sconfitta' }[g.e] || 'Partita')}</div>
       <div class="small muted" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">★ ${nm(g.Migliore)} · ▼ ${nm(g.Peggiore)}${g.Marcatori ? ' · ⚽ ' + esc(g.Marcatori) : ''}</div>
     </div>
-    <div style="text-align:right"><div class="score">${g.pt != null ? fmt(g.pt, g.pt % 1 ? 1 : 0) : '–'}</div>${g.PuntiAvv !== '' && g.PuntiAvv != null ? `<div class="vs">${fmt(Number(g.PuntiAvv), Number(g.PuntiAvv) % 1 ? 1 : 0)} avv.</div>` : ''}</div>
+    <div style="text-align:right"><div class="score">${g.pt != null ? fmtPt(g.pt) : '–'}</div>${g.pa != null ? `<div class="vs">${fmtPt(g.pa)} avv.</div>` : ''}${risultato(g)}</div>
   </button>`;
 }
 
@@ -482,8 +556,10 @@ function pitchHTML(F, opts = {}) {
     } else if (p) {
       const s = d.st[id]; num = s.fm != null ? fmt(s.fm, 1) : '–';
       if (s.forma != null && s.pres >= 2) badge = `<span class="fv ${s.forma >= 7 ? 'good' : s.forma < 6 ? 'bad' : ''}" title="Forma ultime 3">${fmt(s.forma, 1)}</span>`;
+      badge += statoBadge(s.stato);
     }
-    return `<button class="slot ${p ? '' : 'empty'} ${off ? 'off' : ''} ${opts.sel === i ? 'sel' : ''}" ${opts.readonly ? 'disabled style="cursor:default"' : ''} data-slot="${i}" aria-label="${slotLabel(r)}: ${p ? esc(p.Nome) : 'vuoto'}">
+    const ko = p && opts.A == null && d.st[id]?.stato.escluso;
+    return `<button class="slot ${p ? '' : 'empty'} ${off ? 'off' : ''} ${ko ? 'ko' : ''} ${opts.sel === i ? 'sel' : ''}" ${opts.readonly ? 'disabled style="cursor:default"' : ''} data-slot="${i}" aria-label="${slotLabel(r)}: ${p ? esc(p.Nome) : 'vuoto'}">
       <span class="shirt">${p ? `${avatar(p, 'fill')}<b class="val">${num}</b>` : '+'}${badge}</span>
       <span class="lbl">${p ? esc(shortName(p.Nome)) : '&nbsp;'}</span>
       <span class="slot-role">${slotLabel(r)}${off ? ' ⚠' : ''}</span></button>`;
@@ -506,7 +582,7 @@ function pickerHTML(F, i) {
   const ok = d.rosa.filter(p => compat(p, r)).sort(ord), ko = d.rosa.filter(p => !compat(p, r)).sort(ord);
   const row = p => { const s = d.st[p.Id]; return `<button class="li" data-pick="${p.Id}">
       ${avatar(p)}<div class="grow"><div class="name">${esc(p.Nome)} ${roleBadges(p)}${inCampo.has(p.Id) ? ' <span class="chip">in campo</span>' : ''}</div>
-      <div class="sub">${esc(p.Squadra || '')} · ${s.pres} pres.${s.saltataUltima && d.ultimaA ? ' · <span style="color:var(--draw)">non a referto l\'ultima</span>' : ''}</div></div>
+      <div class="sub">${esc(p.Squadra || '')} · ${s.pres} pres.${s.stato.testo ? ` · <span style="color:var(--${s.stato.escluso ? 'loss' : 'draw'})">${statoBadge(s.stato)} ${esc(s.stato.testo)}</span>` : s.saltataUltima && d.ultimaA ? ' · <span style="color:var(--draw)">non a referto l\'ultima</span>' : ''}</div></div>
       <div class="right"><div class="big">${fmt(s.fm, 2)}</div><div class="sub">forma ${fmt(s.forma, 1)}</div></div></button>`; };
   return `<div class="card" style="margin-top:14px"><div class="card-head"><h3>Posto ${slotLabel(r)}</h3>
       <div class="row" style="flex:none;gap:6px">${F.slot[i] ? '<button class="btn ghost small" data-pick="">Svuota</button>' : ''}<button class="x" data-pick-close aria-label="Chiudi">×</button></div></div>
@@ -528,7 +604,10 @@ function currentForm() {
 }
 function vFormazione() {
   const d = D(); const F = currentForm();
-  const fuori = F.slot.map((id, i) => id && !compat(d.byId[id], slotsDi(F.modulo)[i]) ? d.byId[id].Nome : null).filter(Boolean);
+  const fuori = F.slot.map((id, i) => id && d.byId[id] && !compat(d.byId[id], slotsDi(F.modulo)[i]) ? d.byId[id].Nome : null).filter(Boolean);
+  const malus = bonus().fuoriRuolo;
+  const assenti = F.slot.filter(id => id && d.byId[id] && (d.st[id].stato.escluso || !attivo(d.byId[id]))).map(id => d.byId[id].Nome + (attivo(d.byId[id]) ? '' : ' (ceduto)'));
+  const avvisi = d.rosa.map(p => ({ p, s: d.st[p.Id] })).filter(x => x.s.stato.m || x.s.stato.auto).sort((a, b) => (b.s.stato.escluso - a.s.stato.escluso));
   const pieni = F.slot.filter(Boolean).length;
   const ranking = Object.keys(MODULI).map(m => ({ m, ...bestXI(m) })).sort((a, b) => b.tot - a.tot);
   const panchina = d.rosa.filter(p => !F.slot.includes(p.Id)).sort((a, b) => d.st[b.Id].score - d.st[a.Id].score);
@@ -545,7 +624,8 @@ function vFormazione() {
       ${pitchHTML(F, { sel: ui.formSel })}
       <div class="tag-line" style="margin-top:10px">
         <span class="chip ${pieni === 11 ? 'ok' : ''}">${pieni}/11 schierati</span>
-        ${fuori.length ? `<span class="chip warn">⚠ Fuori ruolo: ${fuori.map(esc).join(', ')}</span>` : ''}
+        ${fuori.length ? `<span class="chip warn">⚠ Fuori ruolo: ${fuori.map(esc).join(', ')}${malus ? ` (${fmt(malus * fuori.length, 1)})` : ''}</span>` : ''}
+        ${assenti.length ? `<span class="chip warn">🚑 Non disponibili: ${assenti.map(esc).join(', ')}</span>` : ''}
         <span class="chip">Sotto la foto: fantamedia · badge: forma ultime 3</span>
       </div>
       ${ui.formSel != null ? pickerHTML(F, ui.formSel) : ''}
@@ -558,9 +638,16 @@ function vFormazione() {
           <div class="right"><div class="big">${fmt(x.media, 2)}</div><div class="sub">media XI</div></div></button>`).join('')}</div>
         <div class="small muted" style="margin-top:8px">Tocca un modulo per caricare l'undici migliore in quel modulo.</div>
       </div>
+      <div class="card"><div class="card-head"><h3>Indisponibili e avvisi</h3><span class="chip">${avvisi.filter(x => x.s.stato.escluso).length} fuori</span></div>
+        ${avvisi.length ? `<div class="list">${avvisi.map(({ p, s }) => `<button class="li" data-player="${p.Id}">${avatar(p)}
+          <div class="grow"><div class="name">${esc(p.Nome)} ${statoBadge(s.stato.m ? s.stato : s.stato.auto)}</div><div class="sub">${esc(s.stato.testo || (s.stato.auto ? s.stato.auto.testo + ' · segnato disponibile' : ''))}</div></div>
+          <span class="chip ${s.stato.escluso ? 'warn' : ''}">${s.stato.escluso ? 'escluso' : 'ok'}</span></button>`).join('')}</div>`
+          : '<div class="small muted">Nessuno. Tocca un giocatore per segnarlo infortunato, squalificato o in dubbio.</div>'}
+        <div class="small muted" style="margin-top:8px">Rossi e somma di gialli sono dedotti dai voti caricati (probabili). "Consigliami" lascia fuori infortunati e squalificati.</div>
+      </div>
       <div class="card"><div class="card-head"><h3>Panchina</h3><span class="chip">${panchina.length}</span></div>
         <div class="list">${panchina.map(p => { const s = d.st[p.Id]; return `<button class="li" data-player="${p.Id}">${avatar(p)}
-          <div class="grow"><div class="name">${esc(p.Nome)} ${roleBadges(p)}</div><div class="sub">${esc(p.Squadra || '')} · ${s.pres} pres.</div></div>
+          <div class="grow"><div class="name">${esc(p.Nome)} ${roleBadges(p)} ${statoBadge(s.stato)}</div><div class="sub">${esc(p.Squadra || '')} · ${s.pres} pres.</div></div>
           <div class="right"><div class="big">${fmt(s.fm, 2)}</div><div class="sub">forma ${fmt(s.forma, 1)}</div></div></button>`; }).join('')}</div></div>
     </div>
   </div>`;
@@ -582,8 +669,8 @@ function giornataDettaglio(n) {
   openSheet(`<div class="panel-head"><div><div class="small muted">Partita ${g.n}${g.A ? ` · ${g.A}ª giornata Serie A` : ''}</div>
       <h2>${g.Avversario ? 'vs ' + esc(g.Avversario) : 'Partita ' + g.n}</h2></div><button class="x" data-close aria-label="Chiudi">×</button></div>
     <div class="row" style="align-items:center;margin-bottom:14px">${resBadge(g.e, 'lg')}
-      <div><div class="num" style="font-size:34px;font-weight:800;line-height:1">${g.pt != null ? fmt(g.pt, g.pt % 1 ? 1 : 0) : '–'}${g.PuntiAvv !== '' && g.PuntiAvv != null ? ` <span class="muted" style="font-size:22px">– ${fmt(Number(g.PuntiAvv), Number(g.PuntiAvv) % 1 ? 1 : 0)}</span>` : ''}</div>
-      <div class="small muted">${esc(g.F?.modulo || g.Modulo || 'Modulo non registrato')}</div></div></div>
+      <div><div class="num" style="font-size:34px;font-weight:800;line-height:1">${g.pt != null ? fmtPt(g.pt) : '–'}${g.pa != null ? ` <span class="muted" style="font-size:22px">– ${fmtPt(g.pa)}</span>` : ''}</div>
+      <div class="small muted">${esc(g.F?.modulo || g.Modulo || 'Modulo non registrato')}${g.pt != null && g.pa != null ? ` · risultato ${golFanta(g.pt)}-${golFanta(g.pa)}` : ''}${g.eAuto ? ' · esito calcolato dai punti' : ''}</div></div></div>
     ${g.F?.slot?.some(Boolean) ? pitchHTML(g.F, { readonly: true, A: g.A }) + (g.A == null ? '<div class="note" style="margin-top:8px">Collega la giornata di Serie A per vedere i voti in campo.</div>' : '') : '<div class="note">Formazione non registrata per questa partita.</div>'}
     <div class="grid grid-2" style="margin-top:14px">
       <div class="card"><h3>Migliore</h3><div class="pname" style="font-size:18px">${avatar(d.byId[g.Migliore], 'lg')} ★ ${nm(g.Migliore)}</div></div>
@@ -614,18 +701,20 @@ function giornataForm(n) {
   const esist = n != null ? d.giornate.find(x => x.n === Number(n)) : null;
   const next = (d.giornate[d.giornate.length - 1]?.n || 0) + 1;
   const F0 = esist?.F?.slot ? { modulo: esist.F.modulo, slot: [...esist.F.slot] } : JSON.parse(JSON.stringify(currentForm()));
-  const st = { F: F0, sel: null, esito: esist?.e || '' };
+  const st = { F: F0, sel: null, esito: esist?.e || '', manuale: !!esitoK(esist?.Esito) };
   const A0 = esist ? esist.A : (d.ultimaA != null && !d.giornate.some(g => g.A === d.ultimaA) ? d.ultimaA : '');
 
   const draw = panel => {
     const A = panel.querySelector('#gA').value === '' ? null : Number(panel.querySelector('#gA').value);
     const tit = st.F.slot.filter(Boolean);
     const conVoto = A != null ? tit.map(id => ({ id, v: d.votoDi(id, A) })).filter(x => x.v && x.v.FV != null) : [];
-    const stima = conVoto.length ? sum(conVoto.map(x => x.v.FV)) : null;
+    const slots = slotsDi(st.F.modulo); const malus = bonus().fuoriRuolo;
+    const nFuori = st.F.slot.filter((id, i) => id && conVoto.some(x => x.id === id) && !compat(d.byId[id], slots[i])).length;
+    const stima = conVoto.length ? sum(conVoto.map(x => x.v.FV)) + malus * nFuori : null;
     const best = conVoto.slice().sort((a, b) => b.v.FV - a.v.FV);
     panel.querySelector('#stima').innerHTML = A == null ? 'Scegli la giornata di Serie A per i suggerimenti dai voti.'
       : !d.gA.includes(A) ? `Voti della ${A}ª giornata non ancora caricati.`
-      : `Somma fantavoti titolari: <b class="num">${fmt(stima, 1)}</b> (${conVoto.length}/11 a voto, senza sostituzioni né modificatori)
+      : `Somma fantavoti titolari: <b class="num">${fmt(stima, 1)}</b> (${conVoto.length}/11 a voto${malus && nFuori ? `, ${nFuori} fuori ruolo ${fmt(malus * nFuori, 1)}` : ''}, senza sostituzioni né modificatori)
          <div class="row" style="margin-top:8px"><button type="button" class="btn small" id="usaSugg">Compila migliore, peggiore e marcatori</button></div>`;
     const us = panel.querySelector('#usaSugg');
     if (us) us.onclick = () => {
@@ -634,7 +723,7 @@ function giornataForm(n) {
       const marc = [];
       tit.forEach(id => { const v = d.votoDi(id, A); if (!v) return; const g = (Number(v.Gf) || 0) + (Number(v.Rf) || 0); for (let k = 0; k < g; k++) marc.push(d.byId[id].Nome); });
       panel.querySelector('#gMarc').value = marc.join(', ');
-      if (panel.querySelector('#gPt').value === '' && stima != null) panel.querySelector('#gPt').value = stima;
+      if (panel.querySelector('#gPt').value === '' && stima != null) { panel.querySelector('#gPt').value = Math.round(stima * 2) / 2; aggEsito(panel); }
     };
     panel.querySelector('#pitchBox').innerHTML = pitchHTML(st.F, { sel: st.sel, A: A != null && d.gA.includes(A) ? A : undefined }) + (st.sel != null ? pickerHTML(st.F, st.sel) : '');
     panel.querySelectorAll('#pitchBox [data-slot]').forEach(b => b.onclick = () => { st.sel = st.sel === Number(b.dataset.slot) ? null : Number(b.dataset.slot); draw(panel); });
@@ -650,8 +739,9 @@ function giornataForm(n) {
         ${Array.from({ length: 38 }, (_, i) => i + 1).filter(a => !aOpts.includes(a)).map(a => `<option value="${a}">${a}ª</option>`).join('')}</select></div></div>
     <div class="field"><label for="gAvv">Avversario</label><input class="input" id="gAvv" value="${esc(esist?.Avversario || '')}" placeholder="Nome squadra avversaria"></div>
     <div class="row"><div class="field"><label for="gPt">I miei punti</label><input class="input" id="gPt" type="number" step="0.5" inputmode="decimal" value="${esist?.pt ?? ''}"></div>
-      <div class="field"><label for="gPa">Punti avversario</label><input class="input" id="gPa" type="number" step="0.5" inputmode="decimal" value="${esist?.PuntiAvv ?? ''}"></div></div>
-    <div class="field"><label>Esito</label><div class="esito-pick">${['V', 'P', 'S'].map(e => `<button type="button" class="${e}" data-esito="${e}" aria-pressed="${st.esito === e}">${{ V: 'Vittoria', P: 'Pareggio', S: 'Sconfitta' }[e]}</button>`).join('')}</div></div>
+      <div class="field"><label for="gPa">Punti avversario</label><input class="input" id="gPa" type="number" step="0.5" inputmode="decimal" value="${esist?.pa ?? ''}"></div></div>
+    <div class="field"><label>Esito</label><div class="esito-pick">${['V', 'P', 'S'].map(e => `<button type="button" class="${e}" data-esito="${e}" aria-pressed="${st.esito === e}">${{ V: 'Vittoria', P: 'Pareggio', S: 'Sconfitta' }[e]}</button>`).join('')}</div>
+      <div class="small muted" id="esitoInfo" style="margin-top:6px"></div></div>
     <div class="field"><label>Formazione schierata</label>
       <div class="row" style="margin-bottom:8px"><select class="input" id="gMod">${Object.keys(MODULI).map(m => `<option ${m === st.F.modulo ? 'selected' : ''}>${m}</option>`).join('')}</select>
       <button type="button" class="btn" id="gUsaAtt">Usa formazione salvata</button></div>
@@ -663,18 +753,22 @@ function giornataForm(n) {
     <div class="field"><label for="gNote">Note</label><textarea class="input" id="gNote" rows="2">${esc(esist?.Note || '')}</textarea></div>
     <button class="btn primary block" id="gSave">${ICON.save} Salva partita</button>`,
   panel => {
+    panel._st = st;
     draw(panel);
     panel.querySelector('#gA').onchange = () => draw(panel);
     panel.querySelector('#gMod').onchange = e => { st.F = refit(st.F, e.target.value); st.sel = null; draw(panel); };
     panel.querySelector('#gUsaAtt').onclick = () => { st.F = JSON.parse(JSON.stringify(currentForm())); panel.querySelector('#gMod').value = st.F.modulo; draw(panel); };
     panel.querySelectorAll('[data-esito]').forEach(b => b.onclick = () => {
-      st.esito = st.esito === b.dataset.esito ? '' : b.dataset.esito;
-      panel.querySelectorAll('[data-esito]').forEach(x => x.setAttribute('aria-pressed', x.dataset.esito === st.esito));
+      st.esito = st.esito === b.dataset.esito ? '' : b.dataset.esito; st.manuale = !!st.esito;
+      aggEsito(panel);
     });
+    panel.querySelector('#gPt').oninput = () => aggEsito(panel);
+    panel.querySelector('#gPa').oninput = () => aggEsito(panel);
+    aggEsito(panel);
     panel.querySelector('#gSave').onclick = async () => {
       const N = Number(panel.querySelector('#gN').value);
       if (!N) { toast('Inserisci il numero della partita'); return; }
-      if (!esist && d.giornate.some(g => g.n === N) && !confirm(`La partita ${N} esiste già: la sovrascrivo?`)) return;
+      if (d.giornate.some(g => g.n === N && g !== esist) && !confirm(`La partita ${N} esiste già: la sovrascrivo?`)) return;
       const payload = {
         Giornata: N, GiornataA: panel.querySelector('#gA').value, Punteggio: panel.querySelector('#gPt').value,
         Esito: { V: 'Vittoria', P: 'Pareggio', S: 'Sconfitta' }[st.esito] || '', Avversario: panel.querySelector('#gAvv').value.trim(),
@@ -683,11 +777,24 @@ function giornataForm(n) {
         Marcatori: panel.querySelector('#gMarc').value.trim(), Note: panel.querySelector('#gNote').value.trim()
       };
       const btn = panel.querySelector('#gSave'); btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Salvo…';
-      if (esist && esist.n !== N) await apiPost('deleteGiornata', esist.n).catch(() => {});
-      const ok = await write('saveGiornata', payload, 'Partita salvata');
-      if (ok) closeSheet(); else { btn.disabled = false; btn.innerHTML = 'Salva partita'; }
+      // prima salvo la nuova; solo se è andata bene cancello quella col vecchio numero (così non si perde niente)
+      let ok = await write('saveGiornata', payload, 'Partita salvata');
+      if (ok && esist && esist.n !== N) ok = await write('deleteGiornata', esist.n, `Partita spostata da ${esist.n} a ${N}`);
+      if (ok) closeSheet(); else { btn.disabled = false; btn.innerHTML = `${ICON.save} Salva partita`; }
     };
   });
+}
+
+// Esito: si compila da solo dai punti (soglia 66, un gol ogni 6) finché non lo scegli tu a mano
+function aggEsito(panel) {
+  const st = panel._st; if (!st) return;
+  const pt = numOrNull(panel.querySelector('#gPt').value), pa = numOrNull(panel.querySelector('#gPa').value);
+  const auto = esitoAuto(pt, pa);
+  if (!st.manuale && auto) st.esito = auto;
+  panel.querySelectorAll('[data-esito]').forEach(x => x.setAttribute('aria-pressed', x.dataset.esito === st.esito));
+  panel.querySelector('#esitoInfo').textContent = pt != null && pa != null
+    ? `Risultato ${golFanta(pt)}-${golFanta(pa)}${st.manuale ? (auto && auto !== st.esito ? ' · esito scelto a mano (diverso dal calcolo)' : '') : ' · esito calcolato dai punti'}`
+    : 'Inserisci i punti: l\'esito si compila da solo.';
 }
 
 function pick(F, i, id) {
@@ -716,7 +823,7 @@ function stGiocatori() {
   return `<div class="card">
     <div class="card-head"><div class="seg">${[['T', 'Tutti'], ['P', 'Por'], ['D', 'Dif'], ['C', 'Cen'], ['A', 'Att']].map(([k, l]) => `<button data-rep="${k}" aria-pressed="${ui.rep === k}">${l}</button>`).join('')}</div></div>
     <div class="table-wrap"><table class="t"><thead><tr><th>Giocatore</th>${cols.map(([k, l]) => `<th data-sort="${k}" ${ui.sortKey === k ? 'aria-sort="' + (ui.sortDir < 0 ? 'descending' : 'ascending') + '"' : ''}>${l}${ui.sortKey === k ? (ui.sortDir < 0 ? ' ↓' : ' ↑') : ''}</th>`).join('')}</tr></thead>
-    <tbody>${rows.map(s => { const p = d.byId[s.id]; return `<tr data-player="${p.Id}"><td><span class="pname">${avatar(p, 'sm')} ${esc(p.Nome)} ${roleBadges(p)}</span></td>${cols.map(([, , f]) => `<td>${f(s)}</td>`).join('')}</tr>`; }).join('')}</tbody></table></div>
+    <tbody>${rows.map(s => { const p = d.byId[s.id]; return `<tr data-player="${p.Id}"><td><span class="pname">${avatar(p, 'sm')} ${esc(p.Nome)} ${roleBadges(p)} ${statoBadge(s.stato)}</span></td>${cols.map(([, , f]) => `<td>${f(s)}</td>`).join('')}</tr>`; }).join('')}</tbody></table></div>
     <div class="small muted" style="margin-top:10px">Pres = partite a voto in Serie A · Tit = volte titolare nella tua squadra · FM = fantamedia · Forma = media ultime 3 · ★/▼ = migliore/peggiore della tua squadra · Bonus = somma bonus/malus.</div>
   </div>`;
 }
@@ -746,12 +853,13 @@ function stRuoli() {
     const prev = s.pres ? s.score : null;
     const tags = [
       qui.length ? `<span class="tag">In questo ruolo: <b>${fmt(avg(qui), 1)}</b> (${qui.length}×)</span>` : '',
+      s.stato.testo ? `<span class="tag warn">${esc(s.stato.testo)}</span>` : '',
       s.saltataUltima && d.ultimaA && (d.votiP[p.Id] || []).length ? `<span class="tag warn">Non a referto la ${d.ultimaA}ª</span>` : ''
     ].join('');
     return `<button class="rk ${i === 0 && prev != null ? 'top' : ''}" data-player="${p.Id}">
       <span class="rk-pos num">${i + 1}</span>${avatar(p)}
       <span class="rk-main">
-        <span class="rk-name">${esc(p.Nome)}</span>
+        <span class="rk-name">${esc(p.Nome)} ${statoBadge(s.stato)}</span>
         <span class="rk-sub">${esc(p.Squadra || '')}${s.pres ? ` · FM ${fmt(s.fm)} ${trend(s)}` : ' · ancora nessun voto'}</span>
         ${d.gA.length ? ultime5(p.Id) : ''}
         ${tags ? `<span class="rk-tags">${tags}</span>` : ''}
@@ -765,7 +873,7 @@ function stRuoli() {
       ${ruoli.map(x => `<button data-ruolo="${x.r}" aria-pressed="${ui.ruolo === x.r}"><span class="role ${RUOLI[x.r].c}">${RUOLI[x.r].l}</span>${x.ps.length}</button>`).join('')}
     </div>
     <details class="info"><summary>Come si legge?</summary>
-      <ul><li><b>Numero a destra</b> = fantavoto previsto: mix di fantamedia (45%) e forma delle ultime 3 (55%), un po' più basso se non era a referto l'ultima giornata.</li>
+      <ul><li><b>Numero a destra</b> = fantavoto previsto: mix di fantamedia (45%) e forma delle ultime 3 (55%), più basso per ogni assenza nelle ultime 3 giornate e se è in dubbio.</li>
       <li><b>Quadratini</b> = fantavoti delle ultime 5 giornate (– non a referto, sv senza voto).</li>
       <li><b>▲ ▼</b> = in crescita o in calo rispetto alla sua media.</li>
       <li><b>In questo ruolo</b> = fantavoto medio quando l'hai schierato lì.</li></ul></details>
@@ -811,18 +919,30 @@ function playerSheet(id) {
       <div class="card kpi"><span>Gol / Assist</span><b>${s.gol} / ${s.ass}</b><small>${s.amm} 🟨 ${s.esp} 🟥</small></div>
       <div class="card kpi"><span>Nella tua squadra</span><b>${s.tit}</b><small>titolare · ★${s.migl} ▼${s.pegg}</small></div>
     </div>
+    <div class="card" style="margin-top:14px"><div class="card-head"><h3>Disponibilità</h3>${s.stato.auto ? `<span class="chip warn">${statoBadge(s.stato.auto)} ${esc(s.stato.auto.testo)}</span>` : ''}</div>
+      <div class="seg stato-pick">${Object.entries(STATI).map(([k, l]) => `<button data-stato="${k}" aria-pressed="${(S.config?.indisponibili?.[id]?.m || 'ok') === k}">${STATO_ICO[k] || '✅'} ${l}</button>`).join('')}</div>
+      <div class="small muted" style="margin-top:8px">${s.stato.auto?.m === 'squ' ? 'La squalifica è dedotta dai voti: scegli "Disponibile" se non è vero. ' : ''}Infortunati e squalificati non vengono consigliati in formazione.</div></div>
     ${p.Reparto === 'P' ? `<div class="note" style="margin-top:10px">Gol subiti: <b>${s.gs}</b> · Rigori parati: <b>${s.rp}</b></div>` : ''}
     <div class="card" style="margin-top:14px"><h3>Fantavoto per giornata</h3>${chartGiocatore(vs, d.gA)}</div>
     ${Object.keys(s.pos).length ? `<div class="card" style="margin-top:14px"><h3>Posizioni in cui l'hai schierato</h3>${Object.entries(s.pos).sort((a, b) => b[1].n - a[1].n).map(([lab, e]) => `<div class="li"><span class="chip">${lab}</span><div class="grow">${e.n} ${e.n === 1 ? 'volta' : 'volte'}</div><span class="heat" style="${heat(avg(e.fv))}">${fmt(avg(e.fv), 1)}</span></div>`).join('')}</div>` : ''}
-    ${vs.length ? `<div class="card" style="margin-top:14px"><h3>Pagelle</h3><div class="list">${[...vs].reverse().map(v => `<div class="li"><span class="chip">${v.G}ª</span><div class="grow small">${bonusTxt(v)}</div><span class="small muted">voto ${esc(v.Voto)}</span><span class="heat" style="${heat(v.FV)}">${v.FV == null ? 'sv' : fmt(v.FV, 1)}</span></div>`).join('')}</div></div>` : ''}`);
+    ${vs.length ? `<div class="card" style="margin-top:14px"><h3>Pagelle</h3><div class="list">${[...vs].reverse().map(v => `<div class="li"><span class="chip">${v.G}ª</span><div class="grow small">${bonusTxt(v)}</div><span class="small muted">voto ${esc(v.Voto)}</span><span class="heat" style="${heat(v.FV)}">${v.FV == null ? 'sv' : fmt(v.FV, 1)}</span></div>`).join('')}</div></div>` : ''}`,
+  panel => panel.querySelectorAll('[data-stato]').forEach(b => b.onclick = async () => {
+    const nota = b.dataset.stato === 'inf' ? (prompt('Nota (facoltativa), es. "rientro fra 2 settimane"', S.config?.indisponibili?.[id]?.nota || '') ?? null) : '';
+    if (nota === null) return;
+    const ind = { ...(S.config?.indisponibili || {}) };
+    // "Disponibile" resta salvato solo se serve a smentire una squalifica dedotta dai voti
+    if (b.dataset.stato === 'ok' && s.stato.auto?.m !== 'squ') delete ind[id]; else ind[id] = { m: b.dataset.stato, nota: nota.trim(), da: new Date().toISOString().slice(0, 10) };
+    if (await write('saveConfig', { indisponibili: ind }, `${p.Nome}: ${STATI[b.dataset.stato].toLowerCase()}`)) { closeSheet(); playerSheet(id); }
+  }));
 }
 function chartGiocatore(vs, gA) {
   if (!gA.length) return '<div class="small muted">Carica i voti delle giornate per vedere il grafico.</div>';
-  const W = 600, H = 190, pl = 34, pb = 26, pt = 14, base = 6, lo = 2, hi = 16;
+  const top = Math.max(0, ...vs.map(v => v.FV ?? 0));
+  const W = 600, H = 190, pl = 34, pb = 26, pt = 14, base = 6, lo = 2, hi = Math.max(16, Math.ceil(top / 2) * 2 + 2);
   const bw = (W - pl) / gA.length;
   const y = v => pt + (hi - v) * (H - pt - pb) / (hi - lo);
   return `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="Fantavoto per giornata">
-    ${[4, 6, 8, 10, 12, 14].map(t => `<line class="grid-l" x1="${pl}" x2="${W}" y1="${y(t)}" y2="${y(t)}" ${t === base ? 'stroke-dasharray="4 4"' : ''}/><text class="ax" x="${pl - 6}" y="${y(t) + 4}" text-anchor="end">${t}</text>`).join('')}
+    ${[4, 6, 8, 10, 12, 14, 16, 18, 20, 22].filter(t => t < hi).map(t => `<line class="grid-l" x1="${pl}" x2="${W}" y1="${y(t)}" y2="${y(t)}" ${t === base ? 'stroke-dasharray="4 4"' : ''}/><text class="ax" x="${pl - 6}" y="${y(t) + 4}" text-anchor="end">${t}</text>`).join('')}
     ${gA.map((g, i) => { const v = vs.find(x => x.G === g); const cx = pl + i * bw + bw / 2; const w = Math.min(28, bw * .6);
       if (!v) return `<text class="ax" x="${cx}" y="${y(base) - 4}" text-anchor="middle">–</text><text class="ax" x="${cx}" y="${H - 6}" text-anchor="middle">${g}</text>`;
       if (v.FV == null) return `<text class="ax" x="${cx}" y="${y(base) - 4}" text-anchor="middle">sv</text><text class="ax" x="${cx}" y="${H - 6}" text-anchor="middle">${g}</text>`;
@@ -835,7 +955,6 @@ function chartGiocatore(vs, gA) {
 /* ───────── Vista: Altro ───────── */
 function vAltro() {
   const c = S?.config || {}; const b = bonus(); const d = S ? D() : null;
-  const BL = { gol: 'Gol', rigore: 'Rigore segnato', rigoreSbagliato: 'Rigore sbagliato', rigoreParato: 'Rigore parato', golSubito: 'Gol subito', autogol: 'Autogol', amm: 'Ammonizione', esp: 'Espulsione', assist: 'Assist' };
   return `<div class="head"><div><div class="eyebrow">Dati e impostazioni</div><h1>Altro</h1></div>
     <div class="head-actions"><button class="btn" data-act="sync" ${API.url ? '' : 'disabled'}>${ICON.sync} Aggiorna</button></div></div>
   <div class="grid grid-2">
@@ -863,13 +982,21 @@ function vAltro() {
         <div class="field"><label for="cLe">Lega</label><input class="input" id="cLe" value="${esc(c.lega || '')}"></div></div>
       <div class="field"><label for="cBu">Budget crediti</label><input class="input" id="cBu" type="number" value="${esc(c.budget ?? 300)}"></div>
       <h3 style="margin:14px 0 10px">Bonus e malus</h3>
-      <div class="grid" style="grid-template-columns:1fr 1fr;gap:0 10px">${Object.keys(DEFAULT_BONUS).map(k => `<div class="field"><label for="b_${k}">${BL[k]}</label><input class="input" id="b_${k}" type="number" step="0.5" value="${b[k]}"></div>`).join('')}</div>
+      <div class="grid" style="grid-template-columns:1fr 1fr;gap:0 10px">${Object.keys(DEFAULT_BONUS).map(k => `<div class="field"><label for="b_${k}">${BONUS_NOMI[k]}</label><input class="input" id="b_${k}" type="number" step="0.5" inputmode="decimal" value="${b[k]}"></div>`).join('')}</div>
+      <div class="small muted" style="margin:-4px 0 12px">Mantra: il gol può valere diverso per reparto. "Fuori ruolo" (es. -1) si toglie a ogni titolare schierato fuori ruolo nella stima della partita.</div>
+      <h3 style="margin:14px 0 10px">Risultato (gol fantacalcio)</h3>
+      <div class="row"><div class="field"><label for="cSo">Soglia 1° gol</label><input class="input" id="cSo" type="number" step="0.5" inputmode="decimal" value="${esc(c.soglia ?? 66)}"></div>
+        <div class="field"><label for="cFa">Punti per ogni gol in più</label><input class="input" id="cFa" type="number" step="0.5" inputmode="decimal" value="${esc(c.fascia ?? 6)}"></div></div>
       <button class="btn primary block" data-act="salva-config">${ICON.save} Salva impostazioni</button>
     </div>` : ''}
 
     <div class="card"><h3>Aspetto</h3>
       <div class="seg">${[['auto', 'Automatico'], ['light', 'Chiaro'], ['dark', 'Scuro']].map(([k, l]) => `<button data-theme="${k}" aria-pressed="${ui.theme === k}">${l}</button>`).join('')}</div>
       <div class="small muted" style="margin-top:12px">Versione ${VERSION}</div></div>
+
+    ${S ? `<div class="card"><h3>Backup</h3>
+      <div class="small muted" style="margin-bottom:12px">Scarica in un file Excel rosa, voti, partite e statistiche (nell'app Android finisce nella cartella Download).</div>
+      <button class="btn block" data-act="backup">${ICON.save} Esporta backup Excel</button></div>` : ''}
   </div>`;
 }
 
@@ -890,8 +1017,13 @@ function playerForm(id) {
         Ruoli: $$('#pR [aria-pressed="true"]', panel).map(b => b.dataset.r).join(','), Reparto: panel.querySelector('#pRep').value, Attivo: panel.querySelector('#pA').checked };
       if (!nuovo.Nome) { toast('Inserisci il nome'); return; }
       if (nuovo.Nome !== p.Nome) nuovo.Cod = '';
-      const lista = id ? S.rosa.map(x => x.Id === id ? nuovo : x) : [...S.rosa, nuovo];
-      if (await write('saveRosa', lista, 'Rosa aggiornata')) closeSheet();
+      const campi = ['Nome', 'Squadra', 'Crediti', 'Ruoli', 'Reparto', 'Attivo', 'Cod'];
+      const btn = panel.querySelector('#pSave'); btn.disabled = true;
+      // aggiorno solo i campi del modulo sul giocatore fresco dal foglio (Foto e codice cambiati altrove restano)
+      const ok = await salvaRosa(r => id
+        ? r.map(x => x.Id === id ? { ...x, ...Object.fromEntries(campi.filter(k => k !== 'Cod' || nuovo.Cod === '').map(k => [k, nuovo[k]])) } : x)
+        : [...r, nuovo], 'Rosa aggiornata');
+      if (ok) closeSheet(); else btn.disabled = false;
     };
   });
 }
@@ -922,23 +1054,30 @@ async function parseFile(file) {
   const byCod = Object.fromEntries(righe.map(r => [String(r.Cod), r]));
   const trovati = [], updates = [];
   const usati = new Set();
+  // codici già collegati a un mio giocatore: quelle righe non si abbinano per nome a nessun altro
+  const codRosa = new Set(d.tutti.map(p => String(p.Cod || '')).filter(Boolean));
   d.tutti.forEach(p => {
-    let r = p.Cod && byCod[String(p.Cod)];
-    if (!r) {
+    let r = p.Cod ? byCod[String(p.Cod)] : null;
+    // Se il codice è già noto ma non è nel file, il giocatore NON era a referto: niente ricerca per nome
+    // (altrimenti si rischia di prendere il voto di un omonimo).
+    if (!r && !p.Cod) {
       const np = norm(p.Nome);
-      let cand = righe.filter(x => norm(x.Nome) === np);
-      if (!cand.length) cand = righe.filter(x => { const nx = norm(x.Nome); return nx.startsWith(np + ' ') || np.startsWith(nx + ' '); });
+      const libere = righe.filter(x => !codRosa.has(String(x.Cod)));
+      let cand = libere.filter(x => norm(x.Nome) === np);
+      if (!cand.length) cand = libere.filter(x => { const nx = norm(x.Nome); return nx.startsWith(np + ' ') || np.startsWith(nx + ' '); });
       if (cand.length > 1 && p.Squadra) cand = cand.filter(x => norm(x.Squadra) === norm(p.Squadra));
       if (cand.length === 1) r = cand[0];
     }
-    if (r && !usati.has(r.Cod)) {
-      usati.add(r.Cod);
+    if (r && !usati.has(String(r.Cod))) {
+      usati.add(String(r.Cod));
       const sv = String(r.Voto).includes('*');
-      trovati.push({ p, r, row: { Id: p.Id, Cod: r.Cod, Nome: p.Nome, Voto: sv ? 6 : Number(String(r.Voto).replace(',', '.')), SV: sv, Gf: r.Gf, Gs: r.Gs, Rp: r.Rp, Rs: r.Rs, Rf: r.Rf, Au: r.Au, Amm: r.Amm, Esp: r.Esp, Ass: r.Ass } });
-      if (String(p.Cod) !== String(r.Cod) || (r.Squadra && r.Squadra !== p.Squadra)) updates.push({ Id: p.Id, Cod: r.Cod, Squadra: r.Squadra });
+      const voto = Number(String(r.Voto).replace(',', '.'));
+      trovati.push({ p, r, row: { Id: p.Id, Cod: r.Cod, Nome: p.Nome, Voto: sv || isNaN(voto) ? 6 : voto, SV: sv || isNaN(voto), Gf: r.Gf, Gs: r.Gs, Rp: r.Rp, Rs: r.Rs, Rf: r.Rf, Au: r.Au, Amm: r.Amm, Esp: r.Esp, Ass: r.Ass } });
+      const cambiaSq = r.Squadra && norm(r.Squadra) !== norm(p.Squadra);
+      if (String(p.Cod) !== String(r.Cod) || cambiaSq) updates.push({ Id: p.Id, Cod: r.Cod, Squadra: cambiaSq ? r.Squadra : p.Squadra });
     }
   });
-  trovati.forEach(t => t.row.FV = fv(t.row));
+  trovati.forEach(t => t.row.FV = fv(t.row, undefined, t.p.Reparto));
   const assenti = d.rosa.filter(p => !trovati.some(t => t.p.Id === p.Id));
   return { file, foglio: foglio === voluto ? voluto : '', giornata, letti: righe.length, trovati, updates, assenti };
 }
@@ -982,7 +1121,7 @@ function anteprimaSingola(x) {
       <div><b class="num">${fmt(r.media, 1)}</b><span>media FV</span></div>
     </div>
     <div class="imp-line">⚽ <b>${r.gol}</b> gol · 🅰️ <b>${r.ass}</b> assist · 🟨 <b>${r.amm}</b> · 🟥 <b>${r.esp}</b>${r.sv ? ` · ${r.sv} s.v.` : ''}${r.top ? `<br>★ Migliore: <b>${esc(r.top.p.Nome)}</b> ${fmt(r.top.row.FV, 1)}` : ''}</div>
-    ${gia ? '<div class="note warn-note">Questa giornata è già caricata: confermando sostituisco i voti.</div>' : ''}
+    <div class="note warn-note" id="impGia" ${gia ? '' : 'hidden'}>Questa giornata è già caricata: confermando sostituisco i voti.</div>
     <div class="imp-actions">
       <label class="imp-g"><span>Giornata</span><input class="input" id="impG" type="number" min="1" max="38" inputmode="numeric" value="${giornata || ''}"></label>
       <button class="btn primary" id="impSave">${conferma}</button>
@@ -990,6 +1129,7 @@ function anteprimaSingola(x) {
   panel => {
     const gIn = panel.querySelector('#impG');
     if (!giornata) gIn.focus();
+    gIn.oninput = () => { panel.querySelector('#impGia').hidden = !D().gA.includes(Number(gIn.value)); };
     panel.querySelector('#impSave').onclick = async () => {
       const g = Number(gIn.value);
       if (!g) { toast('Indica la giornata'); gIn.focus(); return; }
@@ -1051,10 +1191,29 @@ function anteprimaMultipla(lista) {
   });
 }
 
+/* ───────── Backup Excel ───────── */
+function esportaBackup() {
+  if (!window.XLSX) { toast('Lettore Excel non ancora caricato, riprova tra un attimo'); return; }
+  const d = D(); const wb = XLSX.utils.book_new();
+  const foglio = (nome, righe) => XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(righe.length ? righe : [{}]), nome);
+  foglio('Rosa', (S.rosa || []).map(p => ({ ...p, Stato: d.st[p.Id]?.stato.testo || '' })));
+  foglio('Voti', (S.voti || []).map(v => ({ ...v, FV: fv(v, d.b, d.byId[v.Id]?.Reparto) })).sort((a, b) => a.Giornata - b.Giornata));
+  foglio('Partite', (S.giornate || []).map(g => { const x = d.giornate.find(y => y.n === Number(g.Giornata)); return { ...g, EsitoCalcolato: x?.e || '', Risultato: x?.pt != null && x?.pa != null ? `${golFanta(x.pt)}-${golFanta(x.pa)}` : '' }; }));
+  foglio('Statistiche', d.tutti.map(p => { const s = d.st[p.Id]; return { Nome: p.Nome, Squadra: p.Squadra, Ruoli: p.Ruoli, Presenze: s.pres, SV: s.sv,
+    MV: s.mv == null ? '' : +s.mv.toFixed(2), FM: s.fm == null ? '' : +s.fm.toFixed(2), Forma: s.forma == null ? '' : +s.forma.toFixed(2), Gol: s.gol, Assist: s.ass,
+    Ammonizioni: s.amm, Espulsioni: s.esp, Titolare: s.tit, Migliore: s.migl, Peggiore: s.pegg, Crediti: s.crediti }; }));
+  foglio('Impostazioni', Object.entries(S.config || {}).map(([k, v]) => ({ Chiave: k, Valore: typeof v === 'object' ? JSON.stringify(v) : v })));
+  XLSX.writeFile(wb, `Fanta-backup-${new Date().toISOString().slice(0, 10)}.xlsx`);
+  toast('Backup esportato');
+}
+
 /* ───────── Eventi ───────── */
 function bind(root) {
   root.querySelectorAll('[data-go]').forEach(b => b.onclick = () => { const sc = b.dataset.scroll; go(b.dataset.go); if (sc) setTimeout(() => $('#' + sc)?.scrollIntoView({ behavior: 'smooth' }), 50); });
-  root.querySelectorAll('[data-player]').forEach(b => b.addEventListener('click', () => b.dataset.player && playerSheet(b.dataset.player)));
+  root.querySelectorAll('[data-player]').forEach(b => {
+    b.addEventListener('click', () => b.dataset.player && playerSheet(b.dataset.player));
+    if (b.getAttribute('role') === 'button') b.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); b.click(); } });
+  });
   root.querySelectorAll('[data-giornata]').forEach(b => b.onclick = () => giornataDettaglio(b.dataset.giornata));
   root.querySelectorAll('[data-stat]').forEach(b => b.onclick = () => { ui.statTab = b.dataset.stat; render(); });
   root.querySelectorAll('[data-rep]').forEach(b => b.onclick = () => { ui.rep = b.dataset.rep; render(); });
@@ -1086,9 +1245,11 @@ function bind(root) {
       LS.set('fc_api', API); ui.editForm = null; await sync(false); if (S) go('squadra');
     },
     'salva-config': () => {
-      const bo = {}; Object.keys(DEFAULT_BONUS).forEach(k => bo[k] = Number($('#b_' + k).value) || 0);
-      write('saveConfig', { squadra: $('#cSq').value.trim(), lega: $('#cLe').value.trim(), budget: Number($('#cBu').value) || 300, bonus: bo }, 'Impostazioni salvate');
-    }
+      const bo = {}; Object.keys(DEFAULT_BONUS).forEach(k => bo[k] = numOrNull($('#b_' + k).value.replace(',', '.')) ?? 0);
+      write('saveConfig', { squadra: $('#cSq').value.trim(), lega: $('#cLe').value.trim(), budget: Number($('#cBu').value) || 300, bonus: bo,
+        soglia: Number($('#cSo').value) || 66, fascia: Number($('#cFa').value) || 6 }, 'Impostazioni salvate');
+    },
+    'backup': esportaBackup
   };
   root.querySelectorAll('[data-act]').forEach(b => b.onclick = () => acts[b.dataset.act]?.());
   const fileIn = root.querySelector('#fileVoti'); if (fileIn) fileIn.onchange = e => { const fs = [...e.target.files]; if (fs.length) importFiles(fs).catch(err => toast('File non leggibile: ' + err.message)); e.target.value = ''; };

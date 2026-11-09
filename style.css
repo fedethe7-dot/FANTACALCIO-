@@ -427,3 +427,12 @@ table.t { width: 100%; border-collapse: collapse; font-size: 14px; }
 .imp-multi .li { gap: 12px; }
 .imp-multi .g-in { flex: none; width: 64px; text-align: center; font-size: 18px; font-weight: 700; padding: 8px 4px; }
 .imp-multi .g-in:placeholder-shown { border-color: var(--draw); }
+
+/* v1.4 – disponibilità */
+.stato { display: inline-block; font-size: 13px; line-height: 1; vertical-align: 1px; }
+.slot .stato { position: absolute; left: -14px; top: -10px; z-index: 3; background: var(--surface); border-radius: 50%; padding: 3px; box-shadow: 0 1px 4px rgba(0,0,0,.3); }
+.slot.ko .shirt { box-shadow: 0 0 0 3px var(--loss), 0 3px 10px rgba(0,0,0,.3); opacity: .7; }
+.stato-pick { display: flex; width: 100%; }
+.stato-pick button { flex: 1 1 45%; padding: 10px 8px; }
+.stato-pick button[aria-pressed="true"] { color: var(--accent); }
+.note[hidden] { display: none; }
