@@ -1,6 +1,6 @@
 // Cache dell'interfaccia: i dati arrivano sempre dal foglio (rete), l'app si apre anche offline.
 // Ad ogni aggiornamento cambia il numero qui sotto, altrimenti il telefono tiene la versione vecchia.
-const CACHE = 'fanta-v1.4.0';
+const CACHE = 'fanta-v1.4.1';
 const FILES = ['./', 'index.html', 'style.css', 'app.js', 'xlsx.core.min.js', 'manifest.json', 'icon.svg', 'icon-192.png', 'icon-512.png', 'icon-maskable-512.png'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(FILES))); self.skipWaiting(); });
 self.addEventListener('activate', e => {
